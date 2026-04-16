@@ -6,8 +6,7 @@ from openai import OpenAI
 import streamlit as st
 from dotenv import load_dotenv
 
-if not os.getenv("RAILWAY_ENVIRONMENT"):
-    load_dotenv()
+load_dotenv()
 
 _client = None
 

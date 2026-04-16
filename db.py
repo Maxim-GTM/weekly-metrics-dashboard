@@ -10,8 +10,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from dotenv import load_dotenv
 
-if not os.getenv("RAILWAY_ENVIRONMENT"):
-    load_dotenv()
+load_dotenv()
 
 _pool: ConnectionPool | None = None
 

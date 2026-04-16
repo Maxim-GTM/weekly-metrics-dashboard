@@ -5,9 +5,7 @@ import os
 
 from dotenv import load_dotenv
 
-# Only load .env file for local dev — Railway injects env vars directly
-if not os.getenv("RAILWAY_ENVIRONMENT"):
-    load_dotenv()
+load_dotenv()
 
 # URL path prefix → display name for page category grouping.
 # Used across GSC impressions, GA4 traffic, and GEO traffic breakdowns.

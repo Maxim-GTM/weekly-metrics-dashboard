@@ -1,11 +1,12 @@
 """Weekly Metrics Dashboard — Streamlit entry point."""
 
 import atexit
+import os
 from datetime import date
 
 import streamlit as st
 
-from config import is_ga4_configured, is_gsc_configured
+from config import is_ga4_configured, is_gsc_configured, get_google_credentials
 from db import get_pool, close_pool, latest_data_date
 
 st.set_page_config(
@@ -19,6 +20,18 @@ get_pool()
 atexit.register(close_pool)
 
 st.title("Weekly Metrics Dashboard")
+
+# Debug: show env var status in sidebar (remove after fixing)
+with st.sidebar:
+    with st.expander("Debug: Env Vars"):
+        sa_val = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+        st.write(f"GOOGLE_SERVICE_ACCOUNT_JSON: {'SET (' + str(len(sa_val)) + ' chars)' if sa_val else 'NOT SET'}")
+        if sa_val:
+            st.write(f"  starts with: {repr(sa_val[:20])}")
+        st.write(f"GSC_PROPERTY: {'SET' if os.getenv('GSC_PROPERTY') else 'NOT SET'}")
+        st.write(f"GA4_PROPERTY_ID: {'SET' if os.getenv('GA4_PROPERTY_ID') else 'NOT SET'}")
+        creds = get_google_credentials()
+        st.write(f"get_google_credentials(): {type(creds).__name__ if creds else 'None'}")
 
 # --- Stale data warning ---
 def _data_age_days(table: str) -> int | None:
