@@ -18,7 +18,4 @@ wheels/
 # Data files
 data/
 
-# uv lock
-uv.lock
-
 CLAUDE.md
