@@ -19,7 +19,14 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from config import categorize_page
-from db import query_df, upsert_keywords
+from db import (
+    query_df,
+    upsert_keywords,
+    update_keyword_products,
+    sync_gsc_keyword_rankings,
+    replace_keyword_tiers,
+    has_keyword_tiers,
+)
 from llm import render_chart_insight
 
 # Maps raw intent codes to human-readable labels.
@@ -97,6 +104,7 @@ def _parse_position_tracking_csv(uploaded_file) -> tuple[pd.DataFrame, pd.DataFr
                 "keyword": kw,
                 "date": pd.to_datetime(d, format="%Y%m%d"),
                 "rank": rank,
+                "source": "semrush",
                 "result_type": result_type if pd.notna(rank) else "",
                 "landing_page": landing if pd.notna(rank) else "",
             })
@@ -124,129 +132,34 @@ def _parse_position_tracking_csv(uploaded_file) -> tuple[pd.DataFrame, pd.DataFr
     return keywords_df, daily_df
 
 
-def _parse_date_from_col_name(col: str) -> pd.Timestamp | None:
-    """Parse a human-readable date column like '7th Aug Semrush' or 'Aug 16 GSC'.
+def _parse_tier_sheet(uploaded_file) -> list[dict] | None:
+    """Parse the Keyword Performance sheet → list of {keyword, tier} dicts.
 
-    Returns a Timestamp or None if unparseable.
-    """
-    # Strip source suffix
-    date_part = re.sub(r"\s*(Semrush|GSC)\s*$", "", col, flags=re.IGNORECASE).strip()
-    # Remove ordinal suffixes
-    date_part = re.sub(r"(\d+)(st|nd|rd|th)\b", r"\1", date_part)
-
-    # Try various formats
-    for fmt in ("%d %b", "%b %d", "%d %B", "%B %d"):
-        try:
-            dt = pd.to_datetime(date_part, format=fmt)
-            # Infer year: if month > current month, it's probably last year
-            # Columns go Aug -> Mar, so Aug-Dec = 2025, Jan-Mar = 2026
-            if dt.month >= 8:
-                dt = dt.replace(year=2025)
-            else:
-                dt = dt.replace(year=2026)
-            return dt
-        except (ValueError, TypeError):
-            continue
-    return None
-
-
-def _parse_keyword_tracking_csv(uploaded_file) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Parse the manually maintained keyword tracking CSV.
-
-    Columns: Primary Keywords, Primary/Secondary, Difficulty, Search Volume,
-    then date-stamped rank columns like '7th Aug Semrush', 'Aug 16 GSC'.
-
-    Returns:
-        keywords_df: One row per keyword with static metadata.
-        daily_df: Long-format dataframe with one row per keyword × date × source.
+    Only the first two columns are used (Primary Keywords, Primary/Secondary).
+    All other columns (historical ranks etc) are ignored.
     """
     uploaded_file.seek(0)
     df = pd.read_csv(uploaded_file)
     df.columns = [c.strip() for c in df.columns]
 
-    # Identify the keyword column
-    kw_col = None
-    for candidate in ["Primary Keywords", "Keywords", "Keyword"]:
-        if candidate in df.columns:
-            kw_col = candidate
-            break
-    if kw_col is None:
-        st.error("Could not find a keyword column in the CSV.")
-        return pd.DataFrame(), pd.DataFrame()
-
-    # Identify date columns (contain 'Semrush' or 'GSC')
-    date_cols = [c for c in df.columns if re.search(r"(Semrush|GSC)\s*$", c, re.IGNORECASE)]
-    if not date_cols:
-        st.error("Could not find date-stamped rank columns (expected 'Semrush' or 'GSC' suffix).")
-        return pd.DataFrame(), pd.DataFrame()
-
-    # Build long-format daily data
-    daily_rows = []
-    for _, row in df.iterrows():
-        kw = str(row[kw_col]).strip()
-        if not kw:
-            continue
-        for col in date_cols:
-            dt = _parse_date_from_col_name(col)
-            if dt is None:
-                continue
-            source = "semrush" if "semrush" in col.lower() else "gsc"
-            rank_raw = row.get(col, "-")
-            rank = pd.to_numeric(rank_raw, errors="coerce")
-
-            daily_rows.append({
-                "keyword": kw,
-                "date": dt,
-                "rank": rank,
-                "result_type": source,
-                "landing_page": "",
-            })
-
-    daily_df = pd.DataFrame(daily_rows)
-
-    # Build keyword metadata
-    keywords_df = df[[kw_col]].copy()
-    keywords_df = keywords_df.rename(columns={kw_col: "keyword"})
-    keywords_df["keyword"] = keywords_df["keyword"].str.strip()
-
-    if "Primary/Secondary" in df.columns:
-        keywords_df["tags"] = df["Primary/Secondary"].fillna("")
-    else:
-        keywords_df["tags"] = ""
-
-    keywords_df["intents"] = ""
-
-    if "Search Volume" in df.columns:
-        keywords_df["search_volume"] = pd.to_numeric(df["Search Volume"], errors="coerce")
-    if "Difficulty" in df.columns:
-        keywords_df["difficulty"] = pd.to_numeric(df["Difficulty"], errors="coerce")
-
-    keywords_df["cpc"] = np.nan
-
-    return keywords_df, daily_df
-
-
-def _detect_and_parse_csv(uploaded_file) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Auto-detect CSV format and parse accordingly."""
-    uploaded_file.seek(0)
-    header_bytes = uploaded_file.read(2048).decode("utf-8", errors="replace")
-    uploaded_file.seek(0)
-
-    # SEMrush Position Tracking: has a metadata header starting with "---"
-    # and columns with _YYYYMMDD patterns
-    if "Keyword," in header_bytes and re.search(r"_\d{8}", header_bytes):
-        return _parse_position_tracking_csv(uploaded_file)
-
-    # Manual keyword tracking: has 'Semrush' or 'GSC' in column names
-    if re.search(r"(Semrush|GSC)", header_bytes):
-        return _parse_keyword_tracking_csv(uploaded_file)
-
-    st.error(
-        "Unrecognized CSV format. Expected either:\n"
-        "- SEMrush Position Tracking export (columns with `_YYYYMMDD` dates)\n"
-        "- Keyword tracking sheet (columns ending in 'Semrush' or 'GSC')"
+    kw_col = next(
+        (c for c in ["Primary Keywords", "Keywords", "Keyword"] if c in df.columns),
+        None,
     )
-    return pd.DataFrame(), pd.DataFrame()
+    if kw_col is None or "Primary/Secondary" not in df.columns:
+        st.error(
+            "Expected columns 'Primary Keywords' and 'Primary/Secondary' in the sheet."
+        )
+        return None
+
+    rows = []
+    for _, row in df.iterrows():
+        kw = str(row[kw_col]).strip().lower()
+        tier = str(row["Primary/Secondary"]).strip().lower()
+        if not kw or tier not in ("primary", "secondary"):
+            continue
+        rows.append({"keyword": kw, "tier": tier})
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -254,9 +167,47 @@ def _detect_and_parse_csv(uploaded_file) -> tuple[pd.DataFrame, pd.DataFrame]:
 # ---------------------------------------------------------------------------
 
 def _latest_rank(daily_df: pd.DataFrame) -> pd.DataFrame:
-    """For each keyword return the most recent day's rank, type, and landing page."""
-    latest_date = daily_df["date"].max()
-    return daily_df[daily_df["date"] == latest_date].copy()
+    """Aggregate metrics over the latest Sun–Sat week per (keyword, source).
+
+    Rank = mean across the week. Clicks / Impressions = sum. CTR recomputed.
+    WoW and tier are invariant per (keyword, source) and passed through.
+    Landing page and SERP type are taken from the most recent date in the week
+    (they're categorical, so averaging doesn't apply).
+    """
+    if daily_df.empty:
+        return daily_df.copy()
+    df = daily_df.copy()
+    df["week"] = df["date"].dt.to_period("W-SAT").apply(lambda r: r.start_time)
+    latest_week_per_source = df.groupby("source", observed=True)["week"].transform("max")
+    df = df[df["week"] == latest_week_per_source]
+
+    # Numeric aggregation
+    numeric = (
+        df.groupby(["keyword", "source"], as_index=False, observed=True)
+        .agg(
+            rank=("rank", "mean"),
+            best_rank=("rank", "min"),
+            clicks=("clicks", "sum"),
+            impressions=("impressions", "sum"),
+            wow_change=("wow_change", "max"),
+            tier=("tier", "first"),
+        )
+    )
+    numeric["ctr"] = (
+        numeric["clicks"] / numeric["impressions"].where(numeric["impressions"] > 0)
+    ) * 100
+
+    # Most recent day's categorical fields per (keyword, source)
+    latest_row = (
+        df.sort_values("date")
+        .groupby(["keyword", "source"], as_index=False, observed=True)
+        .agg(
+            date=("date", "last"),
+            landing_page=("landing_page", "last"),
+            result_type=("result_type", "last"),
+        )
+    )
+    return latest_row.merge(numeric, on=["keyword", "source"])
 
 
 def _page_path_from_url(url: str) -> str:
@@ -280,46 +231,90 @@ def _expand_intents(intent_str: str) -> list[str]:
 # Render
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, max_entries=1)
 def _load_keyword_data() -> tuple[pd.DataFrame, pd.DataFrame] | None:
-    """Load keyword data from database."""
-    daily_df = query_df(
-        "SELECT keyword, date, rank, result_type, landing_page FROM keyword_rankings ORDER BY date"
-    )
+    """Load keyword data from database.
+
+    Tier is computed at query time: LEFT JOIN keyword_tiers, default 'tertiary'.
+    """
+    daily_df = query_df("""
+        SELECT kr.keyword, kr.date, kr.rank, kr.source, kr.result_type, kr.landing_page,
+               kr.clicks, kr.impressions,
+               COALESCE(kt.tier, 'tertiary') AS tier
+        FROM keyword_rankings kr
+        LEFT JOIN keyword_tiers kt
+          ON LOWER(TRIM(kt.keyword)) = LOWER(TRIM(kr.keyword))
+        ORDER BY kr.date
+    """)
     if daily_df.empty:
         return None
     daily_df["date"] = pd.to_datetime(daily_df["date"])
     daily_df["rank"] = pd.to_numeric(daily_df["rank"], errors="coerce")
+    daily_df["clicks"] = pd.to_numeric(daily_df["clicks"], errors="coerce")
+    daily_df["impressions"] = pd.to_numeric(daily_df["impressions"], errors="coerce")
+    daily_df["ctr"] = (daily_df["clicks"] / daily_df["impressions"].where(daily_df["impressions"] > 0)) * 100
+    daily_df["source"] = daily_df["source"].astype("category")
+    daily_df["tier"] = daily_df["tier"].astype("category")
 
     keywords_df = query_df("""
-        SELECT DISTINCT ON (keyword)
-            keyword, search_volume, cpc, difficulty, tags, intents
-        FROM keyword_rankings
-        ORDER BY keyword, date DESC
+        SELECT DISTINCT ON (kr.keyword)
+            kr.keyword, kr.search_volume, kr.cpc, kr.difficulty,
+            kr.tags, kr.intents, kr.product,
+            COALESCE(kt.tier, 'tertiary') AS tier
+        FROM keyword_rankings kr
+        LEFT JOIN keyword_tiers kt
+          ON LOWER(TRIM(kt.keyword)) = LOWER(TRIM(kr.keyword))
+        ORDER BY kr.keyword, kr.date DESC
     """)
 
-    # Compute wow_change from data
-    dates = sorted(daily_df["date"].unique())
-    if len(dates) >= 2:
-        latest_date = dates[-1]
-        prev_date = latest_date - pd.Timedelta(days=7)
-        closest_prev = daily_df[daily_df["date"] <= prev_date]["date"].max()
-        if pd.notna(closest_prev):
-            latest_ranks = daily_df[daily_df["date"] == latest_date][["keyword", "rank"]].rename(columns={"rank": "rank_latest"})
-            prev_ranks = daily_df[daily_df["date"] == closest_prev][["keyword", "rank"]].rename(columns={"rank": "rank_prev"})
-            wow = latest_ranks.merge(prev_ranks, on="keyword", how="left")
-            wow["wow_change"] = wow["rank_latest"] - wow["rank_prev"]
-            keywords_df = keywords_df.merge(wow[["keyword", "wow_change"]], on="keyword", how="left")
+    # Compute wow_change per (keyword, source) as the difference between
+    # each keyword's *average rank* in the latest Sun–Sat week and its
+    # average in the previous Sun–Sat week. Smooths over GSC's daily
+    # impression-weighted averages and tolerates days with missing data.
+    wow_parts = []
+    for src, src_df in daily_df.groupby("source"):
+        src_df = src_df.copy()
+        src_df["week"] = (
+            src_df["date"].dt.to_period("W-SAT").apply(lambda r: r.start_time)
+        )
+        weeks = sorted(src_df["week"].unique())
+        if len(weeks) < 2:
+            continue
+        latest_week, prev_week = weeks[-1], weeks[-2]
 
-    if "wow_change" not in keywords_df.columns:
-        keywords_df["wow_change"] = np.nan
+        latest_avg = (
+            src_df[src_df["week"] == latest_week]
+            .groupby("keyword")["rank"].mean()
+            .reset_index()
+            .rename(columns={"rank": "rank_latest"})
+        )
+        prev_avg = (
+            src_df[src_df["week"] == prev_week]
+            .groupby("keyword")["rank"].mean()
+            .reset_index()
+            .rename(columns={"rank": "rank_prev"})
+        )
+        wow = latest_avg.merge(prev_avg, on="keyword", how="inner")
+        wow["wow_change"] = wow["rank_latest"] - wow["rank_prev"]
+        wow["source"] = src
+        wow_parts.append(wow[["keyword", "source", "wow_change"]])
+
+    if wow_parts:
+        wow_all = pd.concat(wow_parts, ignore_index=True)
+        daily_df = daily_df.merge(wow_all, on=["keyword", "source"], how="left")
+    else:
+        daily_df["wow_change"] = np.nan
 
     return keywords_df, daily_df
 
 
 def _insert_keyword_upload(uploaded_file):
-    """Parse a SEMrush CSV and insert into database."""
-    keywords_df, daily_df = _detect_and_parse_csv(uploaded_file)
+    """Parse a SEMrush CSV and insert every keyword into the database.
+
+    Unranked keywords are kept — they're valid tracked keywords (tertiary
+    by default, unless the performance sheet tiers them primary/secondary).
+    """
+    keywords_df, daily_df = _parse_position_tracking_csv(uploaded_file)
     if daily_df.empty:
         return 0
 
@@ -330,7 +325,9 @@ def _insert_keyword_upload(uploaded_file):
         how="left",
     )
     merged["date"] = merged["date"].dt.strftime("%Y-%m-%d")
-    merged = merged.fillna({"tags": "", "intents": "", "result_type": "", "landing_page": ""})
+    if "source" not in merged.columns:
+        merged["source"] = "semrush"
+    merged = merged.fillna({"tags": "", "intents": "", "result_type": "", "landing_page": "", "source": "semrush"})
 
     # Convert to records and replace NaN with None (psycopg needs None, not nan)
     rows = merged.to_dict("records")
@@ -341,12 +338,40 @@ def _insert_keyword_upload(uploaded_file):
                 row[key] = None
 
     upsert_keywords(rows)
+    sync_gsc_keyword_rankings()
     return len(rows)
 
 
 def render():
     st.header("Keyword Performance")
 
+    # --- Tier sheet uploader (source of truth for primary/secondary) ---
+    tiers_loaded = has_keyword_tiers()
+    tier_file = st.file_uploader(
+        "Upload Keyword Performance Sheet (Primary/Secondary classification)",
+        type=["csv"],
+        key="tier_sheet_upload",
+        help=(
+            "Required once. Re-upload any time to refresh tier assignments "
+            "— old tiers are wiped and replaced."
+        ),
+    )
+    if tier_file is not None:
+        rows = _parse_tier_sheet(tier_file)
+        if rows is not None:
+            replace_keyword_tiers(rows)
+            _load_keyword_data.clear()
+            st.success(f"Saved {len(rows):,} keyword tiers.")
+            tiers_loaded = True
+
+    if not tiers_loaded:
+        st.warning(
+            "Upload the Keyword Performance Sheet above before uploading SEMrush data. "
+            "Tiers are required to classify keywords."
+        )
+        return
+
+    # --- SEMrush CSV uploader ---
     uploaded = st.file_uploader(
         "Upload SEMrush Position Tracking CSV",
         type=["csv"],
@@ -358,6 +383,7 @@ def render():
         count = _insert_keyword_upload(uploaded)
         if count:
             st.success(f"Inserted {count:,} keyword ranking rows.")
+            _load_keyword_data.clear()
 
     result = _load_keyword_data()
     if result is None:
@@ -370,19 +396,74 @@ def render():
     if daily_df.empty:
         return
 
-    # --- Date range filter ---
-    all_dates = sorted(daily_df["date"].dt.date.unique())
-    date_range = st.date_input(
-        "Date range",
-        value=(min(all_dates), max(all_dates)),
-        min_value=min(all_dates),
-        max_value=max(all_dates),
-        key="kw_dates",
-    )
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        daily_df = daily_df[
-            (daily_df["date"].dt.date >= date_range[0]) & (daily_df["date"].dt.date <= date_range[1])
-        ]
+    # --- Filters ---
+    col_date, col_tier, col_source, col_product = st.columns(4)
+
+    with col_date:
+        all_dates = sorted(daily_df["date"].dt.date.unique())
+        date_range = st.date_input(
+            "Date range",
+            value=(min(all_dates), max(all_dates)),
+            min_value=min(all_dates),
+            max_value=max(all_dates),
+            key="kw_dates",
+        )
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            daily_df = daily_df[
+                (daily_df["date"].dt.date >= date_range[0]) & (daily_df["date"].dt.date <= date_range[1])
+            ]
+
+    with col_tier:
+        tier_options = ["primary", "secondary", "tertiary"]
+        selected_tiers = st.multiselect(
+            "Tier", tier_options, default=tier_options, key="kw_tier"
+        )
+
+    with col_source:
+        sources = sorted(daily_df["source"].unique())
+        default_source = "semrush" if "semrush" in sources else sources[0]
+        selected_source = st.selectbox(
+            "Source",
+            sources,
+            index=sources.index(default_source),
+            key="kw_source",
+            help="SEMrush and GSC are analyzed independently.",
+        )
+
+    with col_product:
+        products = sorted(keywords_df[keywords_df["product"] != ""]["product"].unique())
+        product_options = ["All"] + products
+        selected_product = st.selectbox("Product", product_options, key="kw_product")
+
+    if selected_tiers:
+        daily_df = daily_df[daily_df["tier"].isin(selected_tiers)]
+        keywords_df = keywords_df[keywords_df["tier"].isin(selected_tiers)]
+    else:
+        daily_df = daily_df.iloc[0:0]
+        keywords_df = keywords_df.iloc[0:0]
+
+    daily_df = daily_df[daily_df["source"] == selected_source]
+
+    # For GSC, restrict to the latest complete Sun–Sat week and show it in the UI.
+    if selected_source == "gsc" and not daily_df.empty:
+        try:
+            from google_api import latest_complete_week
+            sun, sat = latest_complete_week()
+            daily_df = daily_df[
+                (daily_df["date"].dt.date >= sun)
+                & (daily_df["date"].dt.date <= sat)
+            ]
+            st.caption(
+                f"GSC analysis window: **{sun.strftime('%b %d')} – {sat.strftime('%b %d, %Y')}** "
+                f"(latest complete Sun–Sat week, respecting GSC's ~2-day lag)."
+            )
+        except Exception:
+            pass
+
+    if selected_product != "All":
+        product_kws = keywords_df[keywords_df["product"] == selected_product]["keyword"].tolist()
+        daily_df = daily_df[daily_df["keyword"].isin(product_kws)]
+        keywords_df = keywords_df[keywords_df["product"] == selected_product]
 
     latest = _latest_rank(daily_df)
     dates = sorted(daily_df["date"].unique())
@@ -418,19 +499,34 @@ def render():
         lambda u: categorize_page(_page_path_from_url(u))
     )
 
+    snapshot["tier"] = snapshot["keyword"].map(
+        keywords_df.set_index("keyword")["tier"].to_dict()
+    ).fillna("tertiary")
+
+    # Base columns shown for every source
     display_cols = {
         "keyword": "Keyword",
-        "rank": "Rank",
-        "result_type": "SERP Type",
-        "landing_category": "Page Category",
-        "wow_change": "WoW Change",
-        "search_volume": "Volume",
-        "difficulty": "Difficulty",
+        "tier": "Tier",
+        "product": "Product",
+        "source": "Source",
+        "best_rank": "Best Rank",
+        "rank": "Avg Rank",
+        "wow_change": "Avg WoW Change",
     }
+    # Source-specific columns: GSC rows have traffic data; SEMrush rows have market data + SERP features.
+    if selected_source == "gsc":
+        display_cols["impressions"] = "Impressions"
+        display_cols["clicks"] = "Clicks"
+        display_cols["ctr"] = "CTR"
+    else:  # semrush
+        display_cols["result_type"] = "SERP Type"
+        display_cols["search_volume"] = "Volume"
+        display_cols["difficulty"] = "Difficulty"
+
     snapshot_display = (
         snapshot[list(display_cols.keys())]
         .rename(columns=display_cols)
-        .sort_values("Rank")
+        .sort_values("Avg Rank")
     )
 
     st.dataframe(
@@ -438,9 +534,28 @@ def render():
         hide_index=True,
         width="stretch",
         column_config={
-            "Rank": st.column_config.NumberColumn(format="%d"),
-            "WoW Change": st.column_config.NumberColumn(
-                help="Position change vs prior week (negative = improved)",
+            "Best Rank": st.column_config.NumberColumn(
+                format="%.2f",
+                help="Best (lowest) rank observed during the latest Sun–Sat week",
+            ),
+            "Avg Rank": st.column_config.NumberColumn(
+                format="%.2f",
+                help="Average rank across the latest Sun–Sat week",
+            ),
+            "Avg WoW Change": st.column_config.NumberColumn(
+                help="Avg rank this Sun–Sat week − avg rank previous Sun–Sat week (negative = improved)",
+            ),
+            "Impressions": st.column_config.NumberColumn(
+                format="%d",
+                help="GSC impressions summed across the latest Sun–Sat week",
+            ),
+            "Clicks": st.column_config.NumberColumn(
+                format="%d",
+                help="GSC clicks summed across the latest Sun–Sat week",
+            ),
+            "CTR": st.column_config.NumberColumn(
+                format="%.2f%%",
+                help="Weekly CTR = sum(clicks) ÷ sum(impressions)",
             ),
         },
     )
@@ -482,11 +597,16 @@ def render():
             x="date",
             y="rank",
             color="keyword",
-            title="Position Over Time (lower is better)",
+            title=f"Position Over Time ({selected_source.upper()}) — lower is better",
             markers=True,
         )
         fig_trend.update_yaxes(autorange="reversed")
-        fig_trend.update_layout(xaxis_tickformat="%b %d")
+        unique_dates = sorted(trend_df["date"].unique())
+        fig_trend.update_xaxes(
+            tickmode="array",
+            tickvals=unique_dates,
+            tickformat="%b %d",
+        )
         st.plotly_chart(fig_trend, width="stretch")
 
         kw_trend_text = "\n".join(
@@ -537,36 +657,47 @@ def render():
             st.success("All positions were stable this week.")
 
     # ---------------------------------------------------------------
-    # Keyword difficulty vs rank
+    # Product tagging
     # ---------------------------------------------------------------
-    st.subheader("Keyword Difficulty vs Rank")
+    st.subheader("Tag Keywords by Product")
+    st.caption("Assign keywords to Maxim or Bifrost to enable product-level filtering.")
 
-    diff_rank = snapshot[["keyword", "rank", "difficulty", "search_volume"]].dropna(
-        subset=["rank", "difficulty"]
-    )
+    all_keywords = sorted(keywords_df["keyword"].unique())
+    product_map = keywords_df.set_index("keyword")["product"].to_dict()
 
-    if not diff_rank.empty:
-        diff_rank = diff_rank.sort_values("rank")
-        diff_rank["search_volume"] = diff_rank["search_volume"].apply(
-            lambda v: f"{int(v):,}" if pd.notna(v) and v > 0 else "—"
-        )
-        diff_rank["difficulty"] = diff_rank["difficulty"].apply(
-            lambda v: f"{int(v)}" if pd.notna(v) else "—"
-        )
-        diff_rank["rank"] = diff_rank["rank"].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "—")
+    # Build editable dataframe
+    tag_df = pd.DataFrame({
+        "Keyword": all_keywords,
+        "Product": [product_map.get(kw, "") for kw in all_keywords],
+    })
 
-        # Add tag column from keywords_df if available
-        if "tags" in keywords_df.columns:
-            tag_map = keywords_df.set_index("keyword")["tags"].to_dict()
-            diff_rank["tag"] = diff_rank["keyword"].map(tag_map).fillna("")
-
-        display_cols = {"keyword": "Keyword", "rank": "Rank", "difficulty": "Difficulty", "search_volume": "Volume"}
-        if "tag" in diff_rank.columns:
-            display_cols["tag"] = "Tag"
-
-        st.dataframe(
-            diff_rank[list(display_cols.keys())].rename(columns=display_cols),
+    with st.form("product_tag_form", clear_on_submit=False, border=False):
+        edited = st.data_editor(
+            tag_df,
+            column_config={
+                "Product": st.column_config.SelectboxColumn(
+                    options=["", "Maxim", "Bifrost"],
+                    required=False,
+                ),
+            },
             hide_index=True,
             width="stretch",
+            key="product_tagger",
         )
+        submitted = st.form_submit_button("Save product tags")
+
+    if submitted:
+        changes = {}
+        for _, row in edited.iterrows():
+            kw = row["Keyword"]
+            new_product = row["Product"] or ""
+            if new_product != product_map.get(kw, ""):
+                changes[kw] = new_product
+        if changes:
+            update_keyword_products(changes)
+            st.success(f"Updated {len(changes)} keyword(s).")
+            st.cache_data.clear()
+            st.rerun()
+        else:
+            st.info("No changes to save.")
 

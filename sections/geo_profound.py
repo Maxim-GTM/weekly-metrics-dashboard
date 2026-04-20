@@ -15,6 +15,7 @@ from config import (
     OWNED_DOMAINS,
     TOPIC_COMPETITORS,
     categorize_page,
+    categorize_page_deep,
 )
 from db import query_df, upsert_profound
 from llm import render_chart_insight
@@ -27,7 +28,7 @@ PLATFORMS = ["ChatGPT", "Google AI Overviews", "Perplexity"]
 # ---------------------------------------------------------------------------
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, max_entries=1)
 def _load_profound_data_from_db() -> pd.DataFrame | None:
     """Load all Profound data from database."""
     df = query_df("""
@@ -39,6 +40,8 @@ def _load_profound_data_from_db() -> pd.DataFrame | None:
     if df.empty:
         return None
     df["date"] = pd.to_datetime(df["date"])
+    df["platform"] = df["platform"].astype("category")
+    df["topic"] = df["topic"].astype("category")
     return df
 
 
@@ -157,6 +160,7 @@ def render():
     if uploaded is not None:
         rows = _parse_profound_csv_for_db(uploaded)
         upsert_profound(rows)
+        _load_profound_data_from_db.clear()
         st.success(f"Inserted {len(rows):,} rows.")
 
     df = _load_profound_data_from_db()
@@ -211,51 +215,82 @@ def render():
     mentioned = filtered[filtered["is_mentioned"]]
     prompts_appeared = mentioned["prompt"].nunique()
 
-    # Count unique owned articles cited
+    total_rows = len(filtered)
+    mentioned_rows = int(filtered["is_mentioned"].sum())
+
     owned_urls = _extract_owned_urls(filtered)
     unique_articles_cited = owned_urls.nunique() if not owned_urls.empty else 0
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Unique Prompts", total_prompts)
-    m2.metric("Prompts We're Mentioned In", prompts_appeared)
-    m3.metric("Mention Rate", f"{prompts_appeared / total_prompts * 100:.0f}%")
-    m4.metric("Our Articles Cited", unique_articles_cited)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Unique Prompts", total_prompts)
+    m2.metric(
+        "Prompt Reach",
+        f"{prompts_appeared}/{total_prompts}",
+        help="Unique prompts mentioned in at least one row across any platform and day in the date range.",
+    )
+    m3.metric("Our Articles Cited", unique_articles_cited)
 
-    # --- Per-platform appearance ---
-    st.subheader("Mentions by Platform")
+    # --- Per-prompt mention rate distribution, by platform ---
+    st.subheader("Per-Prompt Mention Rate (by Platform)")
+    st.caption(
+        "For each (prompt × platform), mention rate = rows mentioned ÷ total rows "
+        "for that prompt on that platform within the selected date range. "
+        "Then aggregate across prompts to see the distribution and threshold buckets."
+    )
 
-    platform_stats = []
+    per_pp = (
+        filtered.groupby(["platform", "prompt"])
+        .agg(
+            rows=("is_mentioned", "size"),
+            mentioned_rows=("is_mentioned", "sum"),
+        )
+        .reset_index()
+    )
+    per_pp["rate"] = per_pp["mentioned_rows"] / per_pp["rows"] * 100
+
+    per_platform_rows = []
+    threshold_rows = []
     for platform in PLATFORMS:
-        pdf = filtered[filtered["platform"] == platform]
-        total = pdf["prompt"].nunique()
-        appeared = pdf[pdf["is_mentioned"]]["prompt"].nunique()
-        platform_stats.append(
-            {
+        pdf = per_pp[per_pp["platform"] == platform]
+        if pdf.empty:
+            continue
+        rates = pdf["rate"]
+        per_platform_rows.append({
+            "Platform": platform,
+            "Prompts": len(pdf),
+            "Mean mention rate": f"{rates.mean():.1f}%",
+            "≥ 25%": int((rates >= 25).sum()),
+            "≥ 50%": int((rates >= 50).sum()),
+            "≥ 75%": int((rates >= 75).sum()),
+            "= 100%": int((rates >= 100).sum()),
+        })
+        for label, cutoff in [("≥ 25%", 25), ("≥ 50%", 50), ("≥ 75%", 75), ("= 100%", 100)]:
+            threshold_rows.append({
                 "Platform": platform,
-                "Total Prompts": total,
-                "Mentioned": appeared,
-                "Mention Rate": f"{appeared / total * 100:.0f}%" if total else "N/A",
-            }
+                "Threshold": label,
+                "Prompts": int((rates >= cutoff).sum()),
+            })
+
+    if per_platform_rows:
+        st.dataframe(pd.DataFrame(per_platform_rows), hide_index=True, width="stretch")
+        st.caption(
+            "Mean = average per-prompt mention rate on that platform. "
+            "Threshold columns = # prompts whose per-prompt mention rate meets that floor."
         )
 
-    stats_df = pd.DataFrame(platform_stats)
-    col_chart, col_table = st.columns([2, 1])
-
-    with col_chart:
-        fig = px.bar(
-            stats_df,
-            x="Platform",
-            y="Mentioned",
+        thr_df = pd.DataFrame(threshold_rows)
+        fig_thr = px.bar(
+            thr_df,
+            x="Threshold",
+            y="Prompts",
             color="Platform",
-            text="Mentioned",
-            title="Prompts Mentioned by Platform",
+            barmode="group",
+            text="Prompts",
+            title="Prompts reaching each mention-rate threshold, by platform",
+            category_orders={"Threshold": ["≥ 25%", "≥ 50%", "≥ 75%", "= 100%"]},
         )
-        fig.update_traces(textposition="outside")
-        fig.update_layout(showlegend=False)
-        st.plotly_chart(fig, width="stretch")
-
-    with col_table:
-        st.dataframe(stats_df, hide_index=True, width="stretch")
+        fig_thr.update_traces(textposition="outside")
+        st.plotly_chart(fig_thr, width="stretch")
 
     # --- Cross-platform overlap ---
     st.subheader("Cross-Platform Overlap")
@@ -287,48 +322,124 @@ def render():
 
     # --- Our Articles Cited ---
     st.subheader("Our Articles Cited")
+    st.caption(
+        "Top: pages cited in responses where our brand was mentioned. "
+        "Bottom: pages cited in responses where our brand was not mentioned."
+    )
 
-    if owned_urls.empty:
-        st.info("No owned-domain URLs found in citations.")
-    else:
-        url_counts = owned_urls.value_counts().reset_index()
-        url_counts.columns = ["URL", "Times Cited"]
+    def _owned_pages_df(scope_df: pd.DataFrame) -> pd.DataFrame:
+        urls = _extract_owned_urls(scope_df)
+        if urls.empty:
+            return pd.DataFrame(columns=["URL", "Times Cited", "Page", "Page Category"])
+        uc = urls.value_counts().reset_index()
+        uc.columns = ["URL", "Times Cited"]
+        uc["Page"] = uc["URL"].apply(lambda u: urlparse(u).path.rstrip("/") or "/")
+        uc["Page Category"] = uc["Page"].apply(categorize_page_deep)
+        return uc
 
-        # Extract path for readability
-        url_counts["Page"] = url_counts["URL"].apply(
-            lambda u: urlparse(u).path.rstrip("/") or "/"
+    def _render_owned_citations(uc: pd.DataFrame, label: str, insight_id: str):
+        if uc.empty:
+            st.info(f"No owned-domain citations in {label.lower()}.")
+            return
+        fig = px.bar(
+            uc.head(15),
+            x="Times Cited",
+            y="Page",
+            orientation="h",
+            title=f"{label} — Top 15 pages",
         )
-        url_counts["Page Category"] = url_counts["Page"].apply(
-            lambda p: categorize_page(p)
+        fig.update_layout(yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig, width="stretch")
+
+        st.dataframe(
+            uc[["Page", "Page Category", "Times Cited"]],
+            hide_index=True,
+            width="stretch",
         )
 
-        col_chart, col_table = st.columns([2, 1])
-        with col_chart:
-            fig_cited = px.bar(
-                url_counts.head(15),
-                x="Times Cited",
-                y="Page",
-                orientation="h",
-                title="Most Cited Owned Pages (Top 15)",
-            )
-            fig_cited.update_layout(yaxis={"categoryorder": "total ascending"})
-            st.plotly_chart(fig_cited, width="stretch")
-
-        with col_table:
-            st.dataframe(
-                url_counts[["Page", "Page Category", "Times Cited"]],
-                hide_index=True,
-                width="stretch",
-            )
-
-        # Summary by page category
-        cat_cited = url_counts.groupby("Page Category").agg(
+        cat = uc.groupby("Page Category").agg(
             unique_pages=("Page", "nunique"),
             total_citations=("Times Cited", "sum"),
         ).reset_index().sort_values("total_citations", ascending=False)
-        cat_cited.columns = ["Page Category", "Unique Pages", "Total Citations"]
-        st.write("**Citations by page category:**")
-        st.dataframe(cat_cited, hide_index=True, width="stretch")
+        cat.columns = ["Page Category", "Unique Pages", "Total Citations"]
+        st.write(f"**{label} — by page category:**")
+        st.dataframe(cat, hide_index=True, width="stretch")
+
+        # Themed analysis scoped to just this bucket.
+        pages_text = "\n".join(
+            f"  {r['Page']} [{r['Page Category']}]  cited={r['Times Cited']}x"
+            for _, r in uc.head(40).iterrows()
+        )
+        question = (
+            f"These are pages from the '{label}' bucket. "
+            "Group them into 4–6 concrete THEMES that cut across URL categories "
+            "(e.g. 'top-N listicles on AI gateways', 'product comparison pages', "
+            "'Bifrost docs sections'). For each theme, list: "
+            "(1) representative page slugs, "
+            "(2) total citations in the theme. "
+            "Stop there — do not recommend actions, do not explain causes, just surface the themes."
+        )
+        render_chart_insight(insight_id, pages_text, question)
+
+    mentioned_pages = _owned_pages_df(filtered[filtered["is_mentioned"]])
+    not_mentioned_pages = _owned_pages_df(filtered[~filtered["is_mentioned"]])
+
+    st.markdown("##### Cited + Mentioned")
+    _render_owned_citations(mentioned_pages, "Cited + Mentioned", "cited_mentioned_themes")
+
+    st.markdown("##### Cited but Not Mentioned")
+    _render_owned_citations(not_mentioned_pages, "Cited but Not Mentioned", "cited_not_mentioned_themes")
+
+    # ------------------------------------------------------------------
+    # CITATIONS VS MENTIONS — diverging bar, per-prompt gap
+    # ------------------------------------------------------------------
+    st.subheader("Citations vs Mentions Gap (per prompt)")
+    st.caption(
+        "Gap = citation rate − mention rate (percentage points). "
+        "Positive = cited but not mentioned by name. "
+        "Negative = mentioned without a citation (attribution-only)."
+    )
+
+    cite_mention = (
+        filtered.groupby("prompt")
+        .agg(
+            mention_rate=("is_mentioned", "mean"),
+            cite_rate=("has_fp_citation", "mean"),
+            topic=("topic", "first"),
+        )
+        .reset_index()
+    )
+    cite_mention["mention_rate"] *= 100
+    cite_mention["cite_rate"] *= 100
+    cite_mention["gap"] = cite_mention["cite_rate"] - cite_mention["mention_rate"]
+    cite_mention["abs_gap"] = cite_mention["gap"].abs()
+
+    top_gap = cite_mention[cite_mention["abs_gap"] > 0].sort_values("abs_gap", ascending=False).head(20)
+
+    if not top_gap.empty:
+        top_gap = top_gap.sort_values("gap")
+        top_gap["label"] = top_gap["prompt"].str[:60]
+        top_gap["direction"] = top_gap["gap"].apply(
+            lambda v: "Cited, not mentioned" if v > 0 else "Mentioned, not cited"
+        )
+        fig_gap = px.bar(
+            top_gap,
+            x="gap",
+            y="label",
+            color="direction",
+            orientation="h",
+            title="Top 20 prompts by citation-vs-mention gap (percentage points)",
+            color_discrete_map={
+                "Cited, not mentioned": "#14b8a6",
+                "Mentioned, not cited": "#ef4444",
+            },
+            labels={"gap": "Citation rate − Mention rate (pp)", "label": ""},
+        )
+        fig_gap.add_vline(x=0, line_color="#888", line_dash="dash")
+        fig_gap.update_layout(
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_gap, width="stretch")
 
     # ------------------------------------------------------------------
     # COMPETITOR MENTIONS — replaces old "Most Cited Pages" section
@@ -340,6 +451,43 @@ def render():
     if comp_names.empty:
         st.info("No competitor mentions found in the filtered data.")
     else:
+        # --- Mention rate comparison: us vs each competitor (prompt-level) ---
+        total_prompts_for_rate = filtered["prompt"].nunique()
+        our_rate = prompts_appeared / total_prompts_for_rate * 100 if total_prompts_for_rate else 0
+
+        # For each competitor, count unique prompts where their name appears in any mention row
+        comp_rates = []
+        mentions_lower = filtered["mentions"].fillna("").str.lower()
+        for name in COMPETITOR_NAMES:
+            hit_rows = filtered[mentions_lower.str.contains(rf"\b{re.escape(name)}\b", regex=True)]
+            if hit_rows.empty:
+                continue
+            n_prompts = hit_rows["prompt"].nunique()
+            comp_rates.append({
+                "Entity": name.title(),
+                "Mention Rate (%)": n_prompts / total_prompts_for_rate * 100,
+                "Kind": "Competitor",
+            })
+
+        if comp_rates:
+            comp_rates_df = pd.DataFrame(comp_rates).sort_values("Mention Rate (%)", ascending=False).head(10)
+            us_row = pd.DataFrame([{"Entity": "Us", "Mention Rate (%)": our_rate, "Kind": "Us"}])
+            rate_df = pd.concat([us_row, comp_rates_df], ignore_index=True)
+            fig_rate = px.bar(
+                rate_df,
+                x="Mention Rate (%)",
+                y="Entity",
+                orientation="h",
+                color="Kind",
+                color_discrete_map={"Us": "#3b82f6", "Competitor": "#94a3b8"},
+                title="Mention Rate — Us vs Top Competitors",
+                text="Mention Rate (%)",
+            )
+            fig_rate.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
+            fig_rate.update_layout(yaxis={"categoryorder": "total ascending"})
+            st.plotly_chart(fig_rate, width="stretch")
+
+        # --- Raw mention frequency chart (original) ---
         comp_counts = comp_names.value_counts().reset_index()
         comp_counts.columns = ["Competitor", "Mentions"]
 
@@ -348,7 +496,7 @@ def render():
             x="Mentions",
             y="Competitor",
             orientation="h",
-            title="Most Mentioned Competitors",
+            title="Most Mentioned Competitors (raw count)",
         )
         fig_comp.update_layout(yaxis={"categoryorder": "total ascending"})
         st.plotly_chart(fig_comp, width="stretch")
@@ -466,46 +614,51 @@ def render():
 
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
-        # Chart: contested prompts where any competitor mentions >= ours
+        # Chart: contested prompts — just us vs the single top rival per prompt
         contested = h2h.copy()
-        contested["max_rival"] = contested[[f"{r}_rate" for r in rivals]].max(axis=1)
-        contested = contested[contested["max_rival"] >= contested["our_rate"]]
-        contested = contested[contested["max_rival"] > 0]
+        rival_rate_cols = [f"{r}_rate" for r in rivals]
+        contested["max_rival_rate"] = contested[rival_rate_cols].max(axis=1)
+        contested["top_rival"] = (
+            contested[rival_rate_cols].idxmax(axis=1).str.replace("_rate", "", regex=False).str.title()
+        )
+        contested = contested[contested["max_rival_rate"] >= contested["our_rate"]]
+        contested = contested[contested["max_rival_rate"] > 0]
 
         if not contested.empty:
-            contested = contested.sort_values("max_rival", ascending=False).head(15)
-            contested["label"] = contested["prompt"].str[:50]
-
-            fig_h2h = go.Figure()
-            fig_h2h.add_trace(
-                go.Bar(
-                    y=contested["label"],
-                    x=contested["our_rate"],
-                    name=topic,
-                    orientation="h",
-                    marker_color="#3b82f6",
-                )
+            contested = contested.sort_values("max_rival_rate", ascending=False).head(15)
+            contested["label"] = (
+                contested["prompt"].str[:55] + "  (vs " + contested["top_rival"] + ")"
             )
-            colors = ["#ef4444", "#f97316", "#eab308", "#84cc16"]
-            for i, rival in enumerate(rivals):
-                fig_h2h.add_trace(
-                    go.Bar(
-                        y=contested["label"],
-                        x=contested[f"{rival}_rate"],
-                        name=rival.title(),
-                        orientation="h",
-                        marker_color=colors[i % len(colors)],
-                    )
-                )
 
-            fig_h2h.update_layout(
-                title=f"Contested Prompts — {topic} vs Competitors",
+            long_df = pd.concat([
+                pd.DataFrame({
+                    "label": contested["label"],
+                    "Entity": topic,
+                    "rate": contested["our_rate"] * 100,
+                }),
+                pd.DataFrame({
+                    "label": contested["label"],
+                    "Entity": "Top rival",
+                    "rate": contested["max_rival_rate"] * 100,
+                }),
+            ])
+
+            fig_h2h = px.bar(
+                long_df,
+                x="rate",
+                y="label",
+                color="Entity",
+                orientation="h",
                 barmode="group",
+                title=f"Contested Prompts — {topic} vs the leading competitor for each prompt",
+                color_discrete_map={topic: "#3b82f6", "Top rival": "#ef4444"},
+                labels={"rate": "Mention Rate (%)", "label": ""},
+            )
+            fig_h2h.update_layout(
                 yaxis={
                     "categoryorder": "array",
                     "categoryarray": contested["label"][::-1].tolist(),
                 },
-                xaxis_title="Mention Rate",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02),
             )
             st.plotly_chart(fig_h2h, width="stretch")
@@ -576,11 +729,62 @@ def render():
         top3 = comp_names.value_counts().head(3)
         comp_summary = "\n".join(f"  {n}: {c}x" for n, c in top3.items())
     missed_text = f"Missed prompts: {missed['prompt'].nunique() if not missed.empty else 0}" if not missed.empty else ""
-    h2h_text = f"""Mention rate: {prompts_appeared}/{total_prompts} ({prompts_appeared/total_prompts*100:.0f}%)
-Per platform: {', '.join(f"{s['Platform']}: {s['Mentioned']}/{s['Total Prompts']}" for s in platform_stats)}
+    per_platform_summary = ", ".join(
+        f"{r['Platform']}: mean {r['Mean mention rate']}, ≥50% on {r['≥ 50%']}/{r['Prompts']} prompts"
+        for r in per_platform_rows
+    )
+    h2h_text = f"""Prompt reach: {prompts_appeared}/{total_prompts}
+Per-platform per-prompt rate: {per_platform_summary}
 Top competitors:\n{comp_summary}
 {missed_text}"""
     render_chart_insight("h2h_competitors", h2h_text, "Where are we losing to competitors and what should we prioritize?")
+
+    # ------------------------------------------------------------------
+    # PER-PROMPT TREND OVER TIME
+    # ------------------------------------------------------------------
+    st.subheader("Prompt Trends Over Time")
+    st.caption(
+        "Daily mention rate per prompt, averaged across platforms "
+        "(= rows mentioned on that date ÷ rows for that prompt on that date)."
+    )
+
+    daily_prompt = (
+        filtered.groupby(["date", "prompt"])
+        .agg(rate=("is_mentioned", "mean"))
+        .reset_index()
+    )
+    daily_prompt["rate"] *= 100
+
+    available_prompts = (
+        filtered.groupby("prompt")["is_mentioned"].sum()
+        .sort_values(ascending=False)
+        .index.tolist()
+    )
+    default_trend = available_prompts[:5]
+    selected_trend = st.multiselect(
+        "Prompts to chart",
+        options=available_prompts,
+        default=default_trend,
+        key="prompt_trend_select",
+    )
+
+    if selected_trend:
+        trend_df = daily_prompt[daily_prompt["prompt"].isin(selected_trend)]
+        fig_trend = px.line(
+            trend_df,
+            x="date",
+            y="rate",
+            color="prompt",
+            markers=True,
+            title="Daily Mention Rate per Prompt (%)",
+            labels={"rate": "Mention rate (%)", "date": "Date"},
+        )
+        unique_dates = sorted(trend_df["date"].unique())
+        fig_trend.update_xaxes(
+            tickmode="array", tickvals=unique_dates, tickformat="%b %d"
+        )
+        fig_trend.update_layout(yaxis_range=[-5, 105])
+        st.plotly_chart(fig_trend, width="stretch")
 
     # --- Prompt-level detail table ---
     st.subheader("Prompt Detail")

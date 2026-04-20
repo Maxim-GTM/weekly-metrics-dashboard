@@ -87,6 +87,24 @@ def upsert_gsc(rows: list[dict]):
     )
 
 
+def upsert_gsc_country(rows: list[dict]):
+    """Upsert GSC country-level aggregates."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO gsc_country (date, country, clicks, impressions, ctr, position)
+        VALUES (%(date)s, %(country)s, %(clicks)s, %(impressions)s, %(ctr)s, %(position)s)
+        ON CONFLICT (date, country) DO UPDATE SET
+            clicks = EXCLUDED.clicks,
+            impressions = EXCLUDED.impressions,
+            ctr = EXCLUDED.ctr,
+            position = EXCLUDED.position
+        """,
+        rows,
+    )
+
+
 def upsert_ga4(rows: list[dict]):
     """Upsert GA4 rows into the ga4 table."""
     if not rows:
@@ -102,6 +120,43 @@ def upsert_ga4(rows: list[dict]):
     )
 
 
+def upsert_ga4_traffic(rows: list[dict]):
+    """Upsert source+medium-level GA4 traffic metrics."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO ga4_traffic
+            (date, session_source, session_medium, sessions, total_users, active_users)
+        VALUES
+            (%(date)s, %(session_source)s, %(session_medium)s,
+             %(sessions)s, %(total_users)s, %(active_users)s)
+        ON CONFLICT (date, session_source, session_medium) DO UPDATE SET
+            sessions = EXCLUDED.sessions,
+            total_users = EXCLUDED.total_users,
+            active_users = EXCLUDED.active_users
+        """,
+        rows,
+    )
+
+
+def upsert_ga4_events(rows: list[dict]):
+    """Upsert GA4 event counts by channel group."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO ga4_events
+            (date, event_name, session_primary_channel_group, event_count)
+        VALUES
+            (%(date)s, %(event_name)s, %(session_primary_channel_group)s, %(event_count)s)
+        ON CONFLICT (date, event_name, session_primary_channel_group) DO UPDATE SET
+            event_count = EXCLUDED.event_count
+        """,
+        rows,
+    )
+
+
 def upsert_keywords(rows: list[dict]):
     """Upsert keyword ranking rows."""
     if not rows:
@@ -109,12 +164,12 @@ def upsert_keywords(rows: list[dict]):
     _batch_execute(
         """
         INSERT INTO keyword_rankings
-            (keyword, date, rank, result_type, landing_page,
+            (keyword, date, source, rank, result_type, landing_page,
              search_volume, cpc, difficulty, tags, intents)
         VALUES
-            (%(keyword)s, %(date)s, %(rank)s, %(result_type)s, %(landing_page)s,
+            (%(keyword)s, %(date)s, %(source)s, %(rank)s, %(result_type)s, %(landing_page)s,
              %(search_volume)s, %(cpc)s, %(difficulty)s, %(tags)s, %(intents)s)
-        ON CONFLICT (keyword, date) DO UPDATE SET
+        ON CONFLICT (keyword, date, source) DO UPDATE SET
             rank = EXCLUDED.rank,
             result_type = EXCLUDED.result_type,
             landing_page = EXCLUDED.landing_page,
@@ -160,6 +215,103 @@ def upsert_profound(rows: list[dict]):
         """,
         rows,
     )
+
+
+def replace_keyword_tiers(rows: list[dict]):
+    """Truncate keyword_tiers and insert fresh rows. rows: [{keyword, tier}]."""
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE keyword_tiers")
+            if rows:
+                cur.executemany(
+                    "INSERT INTO keyword_tiers (keyword, tier) "
+                    "VALUES (%(keyword)s, %(tier)s)",
+                    rows,
+                )
+        conn.commit()
+
+
+def has_keyword_tiers() -> bool:
+    """Return True if keyword_tiers has any rows."""
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT EXISTS(SELECT 1 FROM keyword_tiers)")
+            return cur.fetchone()["exists"]
+
+
+def sync_gsc_keyword_rankings() -> int:
+    """Populate keyword_rankings (source='gsc') from the gsc table.
+
+    For each tracked keyword (anything already in keyword_rankings with
+    source='semrush'), pulls the best (min) position per date from gsc and
+    upserts a matching source='gsc' row. Returns number of rows affected.
+    """
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                WITH tracked AS (
+                    SELECT DISTINCT keyword AS canonical,
+                           LOWER(TRIM(keyword)) AS normalized
+                    FROM keyword_rankings
+                    WHERE source = 'semrush'
+                ),
+                agg AS (
+                    SELECT t.canonical           AS keyword,
+                           g.date                AS date,
+                           SUM(g.clicks)         AS clicks,
+                           SUM(g.impressions)    AS impressions,
+                           MIN(g.position)       AS rank
+                    FROM gsc g
+                    JOIN tracked t
+                      ON LOWER(TRIM(g.query)) = t.normalized
+                    GROUP BY t.canonical, g.date
+                ),
+                best_landing AS (
+                    SELECT DISTINCT ON (t.canonical, g.date)
+                           t.canonical AS keyword,
+                           g.date      AS date,
+                           g.page      AS landing_page
+                    FROM gsc g
+                    JOIN tracked t
+                      ON LOWER(TRIM(g.query)) = t.normalized
+                    ORDER BY t.canonical, g.date, g.position ASC
+                )
+                INSERT INTO keyword_rankings
+                    (keyword, date, source, rank, result_type, landing_page,
+                     search_volume, cpc, difficulty, tags, intents,
+                     clicks, impressions)
+                SELECT a.keyword, a.date, 'gsc', a.rank, '', b.landing_page,
+                       NULL, NULL, NULL, '', '',
+                       a.clicks, a.impressions
+                FROM agg a
+                JOIN best_landing b USING (keyword, date)
+                ON CONFLICT (keyword, date, source) DO UPDATE SET
+                    rank = EXCLUDED.rank,
+                    landing_page = EXCLUDED.landing_page,
+                    clicks = EXCLUDED.clicks,
+                    impressions = EXCLUDED.impressions
+            """)
+            affected = cur.rowcount
+        conn.commit()
+    return affected
+
+
+def update_keyword_products(keyword_products: dict[str, str]):
+    """Update the product tag for keywords. keyword_products: {keyword: product}."""
+    if not keyword_products:
+        return
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            for keyword, product in keyword_products.items():
+                cur.execute(
+                    "UPDATE keyword_rankings SET product = %s WHERE keyword = %s",
+                    (product, keyword),
+                )
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------

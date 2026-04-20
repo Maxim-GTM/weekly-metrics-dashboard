@@ -21,24 +21,31 @@ atexit.register(close_pool)
 st.title("Weekly Metrics Dashboard")
 
 # --- Stale data warning ---
-def _data_age_days(table: str) -> int | None:
-    """Return age in days of the newest row in the table, or None if empty."""
+# Data is "fresh" if it covers up through the latest complete Sun–Sat Saturday.
+# Warning fires only when we're missing days relative to that expected end date.
+from google_api import latest_complete_week
+
+_, expected_latest = latest_complete_week()
+
+def _days_behind(table: str) -> int | None:
+    """Days the table is behind the expected latest Saturday. None if empty."""
     latest = latest_data_date(table)
     if latest is None:
         return None
-    return (date.today() - latest).days
+    gap = (expected_latest - latest).days
+    return gap if gap > 0 else 0
 
-gsc_age = _data_age_days("gsc")
-ga4_age = _data_age_days("ga4")
+gsc_gap = _days_behind("gsc")
+ga4_gap = _days_behind("ga4")
 
 stale = []
-if gsc_age is not None and gsc_age > 7:
-    stale.append(f"GSC data is **{gsc_age} days old**")
-elif gsc_age is None and is_gsc_configured():
+if gsc_gap is not None and gsc_gap > 0:
+    stale.append(f"GSC is **{gsc_gap} day(s) behind** (latest expected: {expected_latest:%b %d})")
+elif gsc_gap is None and is_gsc_configured():
     stale.append("No GSC data yet")
-if ga4_age is not None and ga4_age > 7:
-    stale.append(f"GA4 data is **{ga4_age} days old**")
-elif ga4_age is None and is_ga4_configured():
+if ga4_gap is not None and ga4_gap > 0:
+    stale.append(f"GA4 is **{ga4_gap} day(s) behind** (latest expected: {expected_latest:%b %d})")
+elif ga4_gap is None and is_ga4_configured():
     stale.append("No GA4 data yet")
 
 if stale:

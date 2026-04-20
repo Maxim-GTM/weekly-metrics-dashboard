@@ -26,22 +26,54 @@ KEY_SOURCES = ["google", "github", "(direct)", "youtube", "reddit", "linkedin"]
 def _enrich_ga4_df(df: pd.DataFrame) -> pd.DataFrame:
     """Add derived columns to a GA4 dataframe."""
     df["date"] = pd.to_datetime(df["date"])
-    df["page_category"] = df["page_path"].apply(categorize_page)
+    df["page_category"] = df["page_path"].apply(categorize_page).astype("category")
     df["sessions"] = pd.to_numeric(df["sessions"], errors="coerce").fillna(0)
-    df["source_normalized"] = df["session_source"].str.lower().str.strip()
+    df["source_normalized"] = df["session_source"].str.lower().str.strip().astype("category")
+    df["session_source"] = df["session_source"].astype("category")
+    df["session_medium"] = df["session_medium"].astype("category")
     return df
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, max_entries=1)
 def _load_all_ga4_data() -> pd.DataFrame | None:
-    """Load GA4 data from the database (last 8 weeks max)."""
+    """Load GA4 data from the database (last 4 weeks)."""
     df = query_df(
         "SELECT date, page_path, session_source, session_medium, sessions "
-        "FROM ga4 WHERE date >= CURRENT_DATE - INTERVAL '56 days' ORDER BY date"
+        "FROM ga4 WHERE date >= CURRENT_DATE - INTERVAL '28 days' ORDER BY date"
     )
     if df.empty:
         return None
     return _enrich_ga4_df(df)
+
+
+@st.cache_data(ttl=300, max_entries=1)
+def _load_ga4_traffic() -> pd.DataFrame | None:
+    """Source+medium-level traffic with user counts."""
+    df = query_df(
+        "SELECT date, session_source, session_medium, sessions, total_users, active_users "
+        "FROM ga4_traffic WHERE date >= CURRENT_DATE - INTERVAL '28 days' ORDER BY date"
+    )
+    if df.empty:
+        return None
+    df["date"] = pd.to_datetime(df["date"])
+    df["session_source"] = df["session_source"].astype("category")
+    df["session_medium"] = df["session_medium"].astype("category")
+    return df
+
+
+@st.cache_data(ttl=300, max_entries=1)
+def _load_ga4_events() -> pd.DataFrame | None:
+    """Tracked event counts by channel group."""
+    df = query_df(
+        "SELECT date, event_name, session_primary_channel_group, event_count "
+        "FROM ga4_events WHERE date >= CURRENT_DATE - INTERVAL '28 days' ORDER BY date"
+    )
+    if df.empty:
+        return None
+    df["date"] = pd.to_datetime(df["date"])
+    df["event_name"] = df["event_name"].astype("category")
+    df["session_primary_channel_group"] = df["session_primary_channel_group"].astype("category")
+    return df
 
 
 def render():
@@ -98,7 +130,8 @@ def render():
 
     view = st.radio("View", ["Weekly", "Monthly"], horizontal=True, key="ga4_view")
     if view == "Weekly":
-        df["period"] = df["date"].dt.to_period("W").apply(lambda r: r.start_time)
+        # "W-SAT" = week ending Saturday → start_time is the Sunday.
+        df["period"] = df["date"].dt.to_period("W-SAT").apply(lambda r: r.start_time)
     else:
         df["period"] = df["date"].dt.to_period("M").apply(lambda r: r.start_time)
 
@@ -107,12 +140,19 @@ def render():
     latest_period = periods[-1]
     prev_period = periods[-2] if len(periods) >= 2 else None
     period_label = "Week" if view == "Weekly" else "Month"
+    if view == "Weekly":
+        period_range_label = (
+            f"{latest_period.strftime('%b %d')} – "
+            f"{(latest_period + pd.Timedelta(days=6)).strftime('%b %d, %Y')}"
+        )
+    else:
+        period_range_label = latest_period.strftime("%b %Y")
 
     df_latest = df[df["period"] == latest_period]
     df_prev = df[df["period"] == prev_period] if prev_period is not None else None
 
     # --- Overview (latest period with delta) ---
-    st.subheader(f"Latest {period_label}")
+    st.subheader(f"Period Summary ({period_range_label})")
     latest_sessions = df_latest["sessions"].sum()
 
     session_delta = None
@@ -126,7 +166,7 @@ def render():
     m2.metric("Unique Sources", df_latest["session_source"].nunique())
 
     # --- Traffic by Medium ---
-    st.subheader(f"Traffic by Medium (Latest {period_label})")
+    st.subheader(f"Traffic by Medium ({period_range_label})")
 
     medium_col = "session_medium"
     if medium_col in df.columns:
@@ -161,7 +201,7 @@ def render():
         )
 
     # --- Sessions by source (latest period with change) ---
-    st.subheader(f"Sessions by Source (Latest {period_label})")
+    st.subheader(f"Sessions by Source ({period_range_label})")
 
     source_latest = (
         df_latest.groupby("session_source")["sessions"]
@@ -188,7 +228,7 @@ def render():
     if df_prev is not None:
         src_display["change"] = "Change"
     st.dataframe(
-        source_latest.head(15)[list(src_display.keys())].rename(columns=src_display),
+        source_latest.head(30)[list(src_display.keys())].rename(columns=src_display),
         hide_index=True,
         width="stretch",
     )
@@ -197,28 +237,43 @@ def render():
     st.subheader(f"Source Trend ({view})")
 
     top_sources = source_latest.head(8)["session_source"].tolist()
+    trend_x = "period" if df["period"].nunique() > 1 else "date"
     source_trend = (
         df[df["session_source"].isin(top_sources)]
-        .groupby(["period", "session_source"])["sessions"]
+        .groupby([trend_x, "session_source"])["sessions"]
         .sum()
         .reset_index()
     )
     fig_source_trend = px.line(
         source_trend,
-        x="period",
+        x=trend_x,
         y="sessions",
         color="session_source",
-        title=f"Top Sources Over Time ({view})",
+        title=f"Top Sources Over Time ({view if trend_x == 'period' else 'Daily'})",
         markers=True,
     )
     st.plotly_chart(fig_source_trend, width="stretch")
+
+    if trend_x == "date":
+        totals = (
+            source_trend.groupby("session_source")["sessions"]
+            .sum()
+            .reset_index()
+            .sort_values("sessions", ascending=False)
+        )
+        st.caption(f"Totals across {period_range_label}:")
+        st.dataframe(
+            totals.rename(columns={"session_source": "Source", "sessions": "Sessions"}),
+            hide_index=True,
+            width="stretch",
+        )
 
     src_trend_summary = source_trend.groupby("session_source")["sessions"].agg(["first", "last"]).reset_index()
     src_trend_text = "\n".join(f"  {r['session_source']}: {int(r['first']):,} → {int(r['last']):,}" for _, r in src_trend_summary.iterrows())
     render_chart_insight("source_trend", src_trend_text, "What's driving changes in traffic sources?")
 
     # --- Page category breakdown (latest period with change) ---
-    st.subheader(f"Sessions by Page Category (Latest {period_label})")
+    st.subheader(f"Sessions by Page Category ({period_range_label})")
 
     cat_latest = (
         df_latest.groupby("page_category")["sessions"]
@@ -280,8 +335,44 @@ def render():
     fig_drill.update_layout(showlegend=False)
     st.plotly_chart(fig_drill, width="stretch")
 
+    # --- Inverted drill-down: source breakdown by page category ---
+    st.subheader("Source Breakdown by Page Category")
+
+    available_cats = (
+        df_latest.groupby("page_category")["sessions"]
+        .sum()
+        .sort_values(ascending=False)
+        .index.tolist()
+    )
+    drill_cat = st.selectbox(
+        "Select page category to drill down",
+        available_cats,
+        key="drill_page_category",
+    )
+
+    cat_source_df = (
+        df_latest[df_latest["page_category"] == drill_cat]
+        .groupby("session_source")["sessions"]
+        .sum()
+        .reset_index()
+        .sort_values("sessions", ascending=False)
+        .head(15)
+    )
+
+    fig_cat_src = px.bar(
+        cat_source_df,
+        x="session_source",
+        y="sessions",
+        text="sessions",
+        title=f"Top Sources — {drill_cat}",
+        color="session_source",
+    )
+    fig_cat_src.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
+    fig_cat_src.update_layout(showlegend=False, xaxis_tickangle=-30)
+    st.plotly_chart(fig_cat_src, width="stretch")
+
     # --- GEO Traffic (AI sources) ---
-    st.subheader(f"GEO Traffic — AI Sources (Latest {period_label})")
+    st.subheader(f"GEO Traffic — AI Sources ({period_range_label})")
 
     geo_latest = df_latest[df_latest["source_normalized"].isin(GEO_SOURCES)]
     geo_prev = df_prev[df_prev["source_normalized"].isin(GEO_SOURCES)] if df_prev is not None else None
@@ -316,25 +407,229 @@ def render():
             delta = row.get("change") if "change" in geo_by_source.columns else None
             col.metric(row["session_source"], f"{int(row['sessions']):,}", delta=delta)
 
-        # GEO trend (full data)
+        # GEO trend (full data). Fall back to daily if only one period bucket.
         geo_all = df[df["source_normalized"].isin(GEO_SOURCES)]
+        geo_x = "period" if geo_all["period"].nunique() > 1 else "date"
         geo_trend = (
-            geo_all.groupby(["period", "session_source"])["sessions"]
+            geo_all.groupby([geo_x, "session_source"])["sessions"]
             .sum()
             .reset_index()
         )
         fig_geo_trend = px.line(
             geo_trend,
-            x="period",
+            x=geo_x,
             y="sessions",
             color="session_source",
-            title=f"AI Source Traffic Trend ({view})",
+            title=f"AI Source Traffic Trend ({view if geo_x == 'period' else 'Daily'})",
             markers=True,
         )
         st.plotly_chart(fig_geo_trend, width="stretch")
+
+        if geo_x == "date":
+            geo_totals = (
+                geo_trend.groupby("session_source")["sessions"]
+                .sum()
+                .reset_index()
+                .sort_values("sessions", ascending=False)
+            )
+            st.caption(f"Totals across {period_range_label}:")
+            st.dataframe(
+                geo_totals.rename(columns={"session_source": "AI Source", "sessions": "Sessions"}),
+                hide_index=True,
+                width="stretch",
+            )
 
         geo_trend_text = "\n".join(
             f"  {r['session_source']}: {int(r['sessions']):,}"
             for _, r in geo_by_source.iterrows()
         )
         render_chart_insight("geo_trend", geo_trend_text, "What's the AI traffic trajectory and what does it mean?")
+
+    # ------------------------------------------------------------------
+    # Users & Visits by source/medium (from ga4_traffic)
+    # ------------------------------------------------------------------
+    traffic = _load_ga4_traffic()
+    if traffic is None:
+        st.info(
+            "No source+medium-level user metrics yet. Click **Fetch GSC + GA4 Data** to populate."
+        )
+    else:
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            traffic = traffic[
+                (traffic["date"].dt.date >= date_range[0])
+                & (traffic["date"].dt.date <= date_range[1])
+            ]
+        if view == "Weekly":
+            traffic["period"] = traffic["date"].dt.to_period("W-SAT").apply(lambda r: r.start_time)
+        else:
+            traffic["period"] = traffic["date"].dt.to_period("M").apply(lambda r: r.start_time)
+        t_latest = traffic[traffic["period"] == latest_period]
+        t_prev = traffic[traffic["period"] == prev_period] if prev_period is not None else None
+
+        def _with_change(df_curr, df_prev_agg, key):
+            agg = (
+                df_curr.groupby(key)[["sessions", "total_users", "active_users"]]
+                .sum()
+                .reset_index()
+                .sort_values("sessions", ascending=False)
+            )
+            if df_prev_agg is None:
+                return agg
+            prev = (
+                df_prev_agg.groupby(key)[["sessions", "total_users"]]
+                .sum()
+                .reset_index()
+                .rename(columns={"sessions": "sessions_prev", "total_users": "total_users_prev"})
+            )
+            agg = agg.merge(prev, on=key, how="left").fillna(0)
+            agg["session_change"] = agg.apply(
+                lambda r: f"{(r['sessions'] - r['sessions_prev']) / r['sessions_prev'] * 100:+.0f}%"
+                if r["sessions_prev"] > 0 else "new", axis=1,
+            )
+            agg["user_change"] = agg.apply(
+                lambda r: f"{(r['total_users'] - r['total_users_prev']) / r['total_users_prev'] * 100:+.0f}%"
+                if r["total_users_prev"] > 0 else "new", axis=1,
+            )
+            return agg
+
+        st.subheader(f"Users & Sessions by Source ({period_range_label})")
+        by_src = _with_change(t_latest, t_prev, "session_source").head(30)
+        cols_src = {"session_source": "Source", "sessions": "Sessions", "total_users": "Total Users", "active_users": "Active Users"}
+        if "session_change" in by_src.columns:
+            cols_src["session_change"] = "Session Δ"
+            cols_src["user_change"] = "Users Δ"
+        st.dataframe(
+            by_src[list(cols_src.keys())].rename(columns=cols_src),
+            hide_index=True,
+            width="stretch",
+        )
+
+        st.subheader(f"Users & Sessions by Medium ({period_range_label})")
+        by_med = _with_change(t_latest, t_prev, "session_medium")
+        cols_med = {"session_medium": "Medium", "sessions": "Sessions", "total_users": "Total Users", "active_users": "Active Users"}
+        if "session_change" in by_med.columns:
+            cols_med["session_change"] = "Session Δ"
+            cols_med["user_change"] = "Users Δ"
+        st.dataframe(
+            by_med[list(cols_med.keys())].rename(columns=cols_med),
+            hide_index=True,
+            width="stretch",
+        )
+
+        # Users trend — top 8 sources. Fall back to daily if only one period bucket.
+        top_users = by_src.head(8)["session_source"].tolist()
+        users_x = "period" if traffic["period"].nunique() > 1 else "date"
+        trend_users = (
+            traffic[traffic["session_source"].isin(top_users)]
+            .groupby([users_x, "session_source"])["total_users"]
+            .sum()
+            .reset_index()
+        )
+        user_scale = st.radio(
+            "Y-axis scale",
+            ["Linear", "Log"],
+            horizontal=True,
+            index=1,
+            key="user_trend_scale",
+            help="Log scale makes small sources visible alongside Google.",
+        )
+        fig_users = px.line(
+            trend_users[trend_users["total_users"] > 0],  # drop zeros so log scale works
+            x=users_x,
+            y="total_users",
+            color="session_source",
+            title=f"Total Users Over Time — Top Sources ({view if users_x == 'period' else 'Daily'})",
+            markers=True,
+            log_y=(user_scale == "Log"),
+        )
+        st.plotly_chart(fig_users, width="stretch")
+
+        if users_x == "date":
+            user_totals = (
+                trend_users.groupby("session_source")["total_users"]
+                .sum()
+                .reset_index()
+                .sort_values("total_users", ascending=False)
+            )
+            st.caption(f"Totals across {period_range_label}:")
+            st.dataframe(
+                user_totals.rename(columns={"session_source": "Source", "total_users": "Total Users"}),
+                hide_index=True,
+                width="stretch",
+            )
+
+    # ------------------------------------------------------------------
+    # Conversion events by channel group
+    # ------------------------------------------------------------------
+    events = _load_ga4_events()
+    if events is None:
+        st.info(
+            "No event data yet. Click **Fetch GSC + GA4 Data** — tracked events are fetched "
+            "alongside the main GA4 data."
+        )
+    else:
+        st.subheader(f"Tracked Events ({period_range_label})")
+        st.caption(
+            "Three conversion events, split by GA4's **Session primary channel group** "
+            "(Organic Search / Paid Search / Direct / Referral / Organic Social / Paid Social / etc.)."
+        )
+
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            events = events[
+                (events["date"].dt.date >= date_range[0])
+                & (events["date"].dt.date <= date_range[1])
+            ]
+        if view == "Weekly":
+            events["period"] = events["date"].dt.to_period("W-SAT").apply(lambda r: r.start_time)
+        else:
+            events["period"] = events["date"].dt.to_period("M").apply(lambda r: r.start_time)
+        e_latest = events[events["period"] == latest_period]
+        e_prev = events[events["period"] == prev_period] if prev_period is not None else None
+
+        # Per-event totals with delta
+        totals = e_latest.groupby("event_name")["event_count"].sum().reset_index()
+        if e_prev is not None:
+            prev_totals = (
+                e_prev.groupby("event_name")["event_count"]
+                .sum()
+                .reset_index()
+                .rename(columns={"event_count": "prev"})
+            )
+            totals = totals.merge(prev_totals, on="event_name", how="left").fillna(0)
+
+        ev_cols = st.columns(len(totals)) if len(totals) > 0 else None
+        for col, (_, row) in zip(ev_cols or [], totals.iterrows()):
+            delta = None
+            if "prev" in totals.columns and row["prev"] > 0:
+                delta = f"{(row['event_count'] - row['prev']) / row['prev'] * 100:+.0f}%"
+            col.metric(row["event_name"], f"{int(row['event_count']):,}", delta=delta)
+
+        # Channel-group breakdown (latest period)
+        breakdown = (
+            e_latest.groupby(["event_name", "session_primary_channel_group"])["event_count"]
+            .sum()
+            .reset_index()
+        )
+        if not breakdown.empty:
+            fig_ev = px.bar(
+                breakdown,
+                x="event_name",
+                y="event_count",
+                color="session_primary_channel_group",
+                barmode="stack",
+                text="event_count",
+                title=f"Events by Channel Group ({period_range_label})",
+                labels={"event_name": "Event", "event_count": "Count", "session_primary_channel_group": "Channel Group"},
+            )
+            fig_ev.update_traces(texttemplate="%{text}", textposition="inside")
+            st.plotly_chart(fig_ev, width="stretch")
+
+            st.dataframe(
+                breakdown.pivot(
+                    index="event_name",
+                    columns="session_primary_channel_group",
+                    values="event_count",
+                ).fillna(0).astype(int).reset_index().rename(columns={"event_name": "Event"}),
+                hide_index=True,
+                width="stretch",
+            )

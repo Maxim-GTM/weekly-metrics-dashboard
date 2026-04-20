@@ -8,9 +8,18 @@ from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
     DateRange,
     Dimension,
+    Filter,
+    FilterExpression,
+    FilterExpressionList,
     Metric,
     RunReportRequest,
 )
+
+TRACKED_EVENT_NAMES = [
+    "bifrost_homepage_enterprise_form_submit",
+    "bifrost_demo_form_submit",
+    "bifrost_enterprise_page_form_submit",
+]
 
 from config import (
     get_google_credentials,
@@ -40,16 +49,25 @@ def _get_credentials(scopes: list[str]) -> service_account.Credentials:
 
 
 def _date_range(num_weeks: int = 4) -> tuple[str, str]:
-    """Return (start_date, end_date) aligned to ISO week boundaries (Mon-Sun).
+    """Return (start_date, end_date) aligned to Sun-Sat week boundaries.
 
-    GSC data has a ~2-day lag, so the window ends at the last fully
-    available Sunday. Fetches *num_weeks* complete weeks.
+    The analysis week runs Sun → Sat. GSC data has a ~2-day lag, so the
+    window ends at the last fully available Saturday. Fetches *num_weeks*
+    complete Sun–Sat weeks.
     """
     ref = date.today() - timedelta(days=2)
-    days_since_sunday = ref.isoweekday() % 7  # Sun->0, Mon->1, ..., Sat->6
-    end = ref - timedelta(days=days_since_sunday)  # last Sunday
-    start = end - timedelta(weeks=num_weeks) + timedelta(days=1)  # Monday
+    # isoweekday: Mon=1..Sun=7. Saturday = 6. Days back to last Saturday ≤ ref.
+    days_since_saturday = (ref.isoweekday() - 6) % 7
+    end = ref - timedelta(days=days_since_saturday)  # last Saturday ≤ ref
+    start = end - timedelta(weeks=num_weeks) + timedelta(days=1)  # Sunday
     return start.isoformat(), end.isoformat()
+
+
+def latest_complete_week() -> tuple[date, date]:
+    """Return (sunday, saturday) of the most recent complete Sun–Sat week
+    with GSC data available (respects the ~2-day lag)."""
+    start_str, end_str = _date_range(num_weeks=1)
+    return date.fromisoformat(start_str), date.fromisoformat(end_str)
 
 
 def fetch_gsc_data() -> tuple[int, bool]:
@@ -63,53 +81,57 @@ def fetch_gsc_data() -> tuple[int, bool]:
 
     start_date, end_date = _date_range()
 
-    from db import has_data_for_range, upsert_gsc
-
-    if has_data_for_range("gsc", start_date, end_date):
-        return 0, True
+    from db import (
+        latest_data_date,
+        upsert_gsc,
+        upsert_gsc_country,
+        sync_gsc_keyword_rankings,
+    )
 
     credentials = _get_credentials(GSC_SCOPES)
     service = build("searchconsole", "v1", credentials=credentials)
 
-    all_rows = []
-    start_row = 0
-    page_size = 25000
+    end_date_obj = date.fromisoformat(end_date)
+    gsc_latest = latest_data_date("gsc")
+    gsc_existed = gsc_latest is not None and gsc_latest >= end_date_obj
+    country_latest = latest_data_date("gsc_country")
+    country_existed = country_latest is not None and country_latest >= end_date_obj
 
-    while True:
-        body = {
-            "startDate": start_date,
-            "endDate": end_date,
-            "dimensions": ["date", "page", "query"],
-            "rowLimit": page_size,
-            "startRow": start_row,
-        }
-        response = (
-            service.searchanalytics()
-            .query(siteUrl=site_url, body=body)
-            .execute()
+    # --- Country fetch (date × country aggregates) ---
+    if not country_existed:
+        country_rows = _fetch_gsc_dimensioned(
+            service, site_url, start_date, end_date,
+            dimensions=["date", "country"],
+            mapper=lambda keys, row: {
+                "date": keys[0],
+                "country": keys[1],
+                "clicks": row["clicks"],
+                "impressions": row["impressions"],
+                "ctr": row["ctr"],
+                "position": row["position"],
+            },
         )
+        if country_rows:
+            upsert_gsc_country(country_rows)
 
-        rows = response.get("rows", [])
-        if not rows:
-            break
+    # --- Main fetch (date × page × query) ---
+    if gsc_existed:
+        sync_gsc_keyword_rankings()
+        return 0, True
 
-        for row in rows:
-            keys = row["keys"]
-            all_rows.append(
-                {
-                    "date": keys[0],
-                    "page": keys[1],
-                    "query": keys[2],
-                    "clicks": row["clicks"],
-                    "impressions": row["impressions"],
-                    "ctr": row["ctr"],
-                    "position": row["position"],
-                }
-            )
-
-        if len(rows) < page_size:
-            break
-        start_row += page_size
+    all_rows = _fetch_gsc_dimensioned(
+        service, site_url, start_date, end_date,
+        dimensions=["date", "page", "query"],
+        mapper=lambda keys, row: {
+            "date": keys[0],
+            "page": keys[1],
+            "query": keys[2],
+            "clicks": row["clicks"],
+            "impressions": row["impressions"],
+            "ctr": row["ctr"],
+            "position": row["position"],
+        },
+    )
 
     if not all_rows:
         raise RuntimeError(
@@ -118,7 +140,37 @@ def fetch_gsc_data() -> tuple[int, bool]:
         )
 
     upsert_gsc(all_rows)
+    sync_gsc_keyword_rankings()
     return len(all_rows), False
+
+
+def _fetch_gsc_dimensioned(service, site_url, start_date, end_date, dimensions, mapper):
+    """Run a paginated GSC search-analytics query for the given dimensions."""
+    out = []
+    start_row = 0
+    page_size = 25000
+    while True:
+        body = {
+            "startDate": start_date,
+            "endDate": end_date,
+            "dimensions": dimensions,
+            "rowLimit": page_size,
+            "startRow": start_row,
+        }
+        response = (
+            service.searchanalytics()
+            .query(siteUrl=site_url, body=body)
+            .execute()
+        )
+        rows = response.get("rows", [])
+        if not rows:
+            break
+        for row in rows:
+            out.append(mapper(row["keys"], row))
+        if len(rows) < page_size:
+            break
+        start_row += page_size
+    return out
 
 
 def fetch_ga4_data() -> tuple[int, bool]:
@@ -132,55 +184,80 @@ def fetch_ga4_data() -> tuple[int, bool]:
 
     start_date, end_date = _date_range()
 
-    from db import has_data_for_range, upsert_ga4
+    from db import (
+        latest_data_date,
+        upsert_ga4,
+        upsert_ga4_traffic,
+        upsert_ga4_events,
+    )
 
-    if has_data_for_range("ga4", start_date, end_date):
-        return 0, True
-
+    end_date_obj = date.fromisoformat(end_date)
     credentials = _get_credentials(GA4_SCOPES)
     client = BetaAnalyticsDataClient(credentials=credentials)
 
-    all_rows = []
-    offset = 0
-    page_size = 100000
-
-    while True:
-        request = RunReportRequest(
-            property=f"properties/{property_id}",
-            date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
-            dimensions=[
-                Dimension(name="date"),
-                Dimension(name="pagePath"),
-                Dimension(name="sessionSource"),
-                Dimension(name="sessionMedium"),
-            ],
-            metrics=[
-                Metric(name="sessions"),
-            ],
-            limit=page_size,
-            offset=offset,
+    # --- Source+medium-level traffic with user counts ---
+    traffic_latest = latest_data_date("ga4_traffic")
+    if traffic_latest is None or traffic_latest < end_date_obj:
+        traffic_rows = _fetch_ga4_report(
+            client, property_id, start_date, end_date,
+            dimensions=["date", "sessionSource", "sessionMedium"],
+            metrics=["sessions", "totalUsers", "activeUsers"],
+            mapper=lambda dims, metrics: {
+                "date": _ga4_date(dims[0]),
+                "session_source": dims[1],
+                "session_medium": dims[2],
+                "sessions": int(metrics[0]),
+                "total_users": int(metrics[1]),
+                "active_users": int(metrics[2]),
+            },
         )
-        response = client.run_report(request)
+        if traffic_rows:
+            upsert_ga4_traffic(traffic_rows)
 
-        if not response.rows:
-            break
+    # --- Tracked events by channel group ---
+    events_latest = latest_data_date("ga4_events")
+    if events_latest is None or events_latest < end_date_obj:
+        event_filter = FilterExpression(
+            or_group=FilterExpressionList(expressions=[
+                FilterExpression(filter=Filter(
+                    field_name="eventName",
+                    string_filter=Filter.StringFilter(value=name),
+                ))
+                for name in TRACKED_EVENT_NAMES
+            ])
+        )
+        event_rows = _fetch_ga4_report(
+            client, property_id, start_date, end_date,
+            dimensions=["date", "eventName", "sessionPrimaryChannelGroup"],
+            metrics=["eventCount"],
+            dimension_filter=event_filter,
+            mapper=lambda dims, metrics: {
+                "date": _ga4_date(dims[0]),
+                "event_name": dims[1],
+                "session_primary_channel_group": dims[2],
+                "event_count": int(metrics[0]),
+            },
+        )
+        if event_rows:
+            upsert_ga4_events(event_rows)
 
-        for row in response.rows:
-            raw_date = row.dimension_values[0].value
-            formatted_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
-            all_rows.append(
-                {
-                    "date": formatted_date,
-                    "page_path": row.dimension_values[1].value,
-                    "session_source": row.dimension_values[2].value,
-                    "session_medium": row.dimension_values[3].value,
-                    "sessions": int(row.metric_values[0].value),
-                }
-            )
+    # --- Main page-level sessions fetch (existing ga4 table) ---
+    ga4_latest = latest_data_date("ga4")
+    if ga4_latest is not None and ga4_latest >= end_date_obj:
+        return 0, True
 
-        if len(response.rows) < page_size:
-            break
-        offset += page_size
+    all_rows = _fetch_ga4_report(
+        client, property_id, start_date, end_date,
+        dimensions=["date", "pagePath", "sessionSource", "sessionMedium"],
+        metrics=["sessions"],
+        mapper=lambda dims, metrics: {
+            "date": _ga4_date(dims[0]),
+            "page_path": dims[1],
+            "session_source": dims[2],
+            "session_medium": dims[3],
+            "sessions": int(metrics[0]),
+        },
+    )
 
     if not all_rows:
         raise RuntimeError(
@@ -190,3 +267,47 @@ def fetch_ga4_data() -> tuple[int, bool]:
 
     upsert_ga4(all_rows)
     return len(all_rows), False
+
+
+def _ga4_date(raw: str) -> str:
+    """Convert GA4's YYYYMMDD date dim to YYYY-MM-DD."""
+    return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+
+
+def _fetch_ga4_report(
+    client,
+    property_id: str,
+    start_date: str,
+    end_date: str,
+    dimensions: list[str],
+    metrics: list[str],
+    mapper,
+    dimension_filter=None,
+    page_size: int = 100000,
+) -> list[dict]:
+    """Run a paginated GA4 runReport and return mapped rows."""
+    out = []
+    offset = 0
+    while True:
+        kwargs = dict(
+            property=f"properties/{property_id}",
+            date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
+            dimensions=[Dimension(name=d) for d in dimensions],
+            metrics=[Metric(name=m) for m in metrics],
+            limit=page_size,
+            offset=offset,
+        )
+        if dimension_filter is not None:
+            kwargs["dimension_filter"] = dimension_filter
+        request = RunReportRequest(**kwargs)
+        response = client.run_report(request)
+        if not response.rows:
+            break
+        for row in response.rows:
+            dims = [d.value for d in row.dimension_values]
+            mvals = [m.value for m in row.metric_values]
+            out.append(mapper(dims, mvals))
+        if len(response.rows) < page_size:
+            break
+        offset += page_size
+    return out

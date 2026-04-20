@@ -49,6 +49,29 @@ def categorize_page(page_path: str) -> str:
     return "Other"
 
 
+# Top-level prefixes where the 2nd path segment is a meaningful subcategory.
+# e.g. /bifrost/resources/xyz → "Bifrost > resources", but /articles/<slug>
+# stays just "Articles" (slug is unique per page, drill-down is noise).
+DEEP_CATEGORY_PREFIXES = {"/bifrost", "/compare"}
+
+
+def categorize_page_deep(page_path: str) -> str:
+    """Category with one-level drill-down where meaningful.
+
+    e.g. '/bifrost/resources/foo' → 'Bifrost > resources'.
+    """
+    top = categorize_page(page_path)
+    if not isinstance(page_path, str) or not page_path:
+        return top
+    parts = [p for p in page_path.split("/") if p]
+    if not parts:
+        return top
+    first_prefix = "/" + parts[0]
+    if first_prefix in DEEP_CATEGORY_PREFIXES and len(parts) >= 2:
+        return f"{top} > {parts[1]}"
+    return top
+
+
 # --- GEO / Profound constants ---
 
 OWNED_DOMAINS = {
