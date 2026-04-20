@@ -157,9 +157,15 @@ def get_google_credentials() -> dict | str | None:
     # If it looks like JSON, parse it
     if val.startswith("{"):
         try:
-            return json.loads(val)
+            creds = json.loads(val)
         except json.JSONDecodeError:
             return None
+        # Env-var storage often escapes newlines in the private key as literal
+        # "\n" (backslash + n). PEM parsing needs real newlines.
+        pk = creds.get("private_key")
+        if isinstance(pk, str) and "\\n" in pk and "\n" not in pk:
+            creds["private_key"] = pk.replace("\\n", "\n")
+        return creds
     # Otherwise treat as file path
     if not os.path.exists(val):
         return None
