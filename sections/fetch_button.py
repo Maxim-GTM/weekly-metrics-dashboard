@@ -23,29 +23,23 @@ def render_fetch_button():
         )
 
     if fetch_clicked:
+        from google_api import button_date_range, fetch_gsc_data, fetch_ga4_data
+        start_date, end_date = button_date_range()
         results = []
         with col_status:
             if is_gsc_configured():
                 with st.spinner("Fetching GSC data..."):
                     try:
-                        from google_api import fetch_gsc_data
-                        count, existed = fetch_gsc_data()
-                        if existed:
-                            results.append(("info", "GSC: data already exists for this period"))
-                        else:
-                            results.append(("success", f"GSC: inserted {count:,} rows"))
+                        count = fetch_gsc_data(start_date, end_date)
+                        results.append(("success", f"GSC: upserted {count:,} rows ({start_date} → {end_date})"))
                     except Exception as e:
                         results.append(("error", f"GSC: {e}"))
 
             if is_ga4_configured():
                 with st.spinner("Fetching GA4 data..."):
                     try:
-                        from google_api import fetch_ga4_data
-                        count, existed = fetch_ga4_data()
-                        if existed:
-                            results.append(("info", "GA4: data already exists for this period"))
-                        else:
-                            results.append(("success", f"GA4: inserted {count:,} rows"))
+                        count = fetch_ga4_data(start_date, end_date)
+                        results.append(("success", f"GA4: upserted {count:,} rows ({start_date} → {end_date})"))
                     except Exception as e:
                         results.append(("error", f"GA4: {e}"))
 

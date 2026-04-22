@@ -64,11 +64,11 @@ def _get_credentials(scopes: list[str]) -> service_account.Credentials:
     )
 
 
-def _date_range(num_weeks: int = 4) -> tuple[str, str]:
+def button_date_range(num_weeks: int = 4) -> tuple[str, str]:
     """Return (start_date, end_date) aligned to Sun-Sat week boundaries.
 
     The analysis week runs Sun → Sat. GSC data has a ~2-day lag, so the
-    window ends at the last fully available Saturday. Fetches *num_weeks*
+    window ends at the last fully available Saturday. Covers *num_weeks*
     complete Sun–Sat weeks.
     """
     ref = date.today() - timedelta(days=2)
@@ -82,23 +82,20 @@ def _date_range(num_weeks: int = 4) -> tuple[str, str]:
 def latest_complete_week() -> tuple[date, date]:
     """Return (sunday, saturday) of the most recent complete Sun–Sat week
     with GSC data available (respects the ~2-day lag)."""
-    start_str, end_str = _date_range(num_weeks=1)
+    start_str, end_str = button_date_range(num_weeks=1)
     return date.fromisoformat(start_str), date.fromisoformat(end_str)
 
 
-def fetch_gsc_data() -> tuple[int, bool]:
-    """Fetch GSC Search Analytics data and write to database.
+def fetch_gsc_data(start_date: str, end_date: str) -> int:
+    """Fetch GSC Search Analytics data for the given range and upsert to DB.
 
-    Returns (row_count, already_existed).
+    Returns row count for the main (date × page × query) table.
     """
     site_url = get_gsc_property()
     if not site_url:
         raise RuntimeError("GSC_PROPERTY not set in .env")
 
-    start_date, end_date = _date_range()
-
     from db import (
-        latest_data_date,
         upsert_gsc,
         upsert_gsc_country,
         upsert_gsc_page_daily,
@@ -109,74 +106,57 @@ def fetch_gsc_data() -> tuple[int, bool]:
     credentials = _get_credentials(GSC_SCOPES)
     service = build("searchconsole", "v1", credentials=credentials)
 
-    end_date_obj = date.fromisoformat(end_date)
-    gsc_latest = latest_data_date("gsc")
-    gsc_existed = gsc_latest is not None and gsc_latest >= end_date_obj
-    country_latest = latest_data_date("gsc_country")
-    country_existed = country_latest is not None and country_latest >= end_date_obj
-    page_daily_latest = latest_data_date("gsc_page_daily")
-    page_daily_existed = page_daily_latest is not None and page_daily_latest >= end_date_obj
-    site_daily_latest = latest_data_date("gsc_site_daily")
-    site_daily_existed = site_daily_latest is not None and site_daily_latest >= end_date_obj
-
     # --- Site-level daily totals (date only, no page/query dim — matches GSC UI exactly) ---
-    if not site_daily_existed:
-        site_daily_rows = _fetch_gsc_dimensioned(
-            service, site_url, start_date, end_date,
-            dimensions=["date"],
-            mapper=lambda keys, row: {
-                "date": keys[0],
-                "clicks": row["clicks"],
-                "impressions": row["impressions"],
-                "ctr": row["ctr"],
-                "position": row["position"],
-            },
-        )
-        if site_daily_rows:
-            upsert_gsc_site_daily(site_daily_rows)
+    site_daily_rows = _fetch_gsc_dimensioned(
+        service, site_url, start_date, end_date,
+        dimensions=["date"],
+        mapper=lambda keys, row: {
+            "date": keys[0],
+            "clicks": row["clicks"],
+            "impressions": row["impressions"],
+            "ctr": row["ctr"],
+            "position": row["position"],
+        },
+    )
+    if site_daily_rows:
+        upsert_gsc_site_daily(site_daily_rows)
 
     # --- Country fetch (date × country aggregates) ---
-    if not country_existed:
-        country_rows = _fetch_gsc_dimensioned(
-            service, site_url, start_date, end_date,
-            dimensions=["date", "country"],
-            mapper=lambda keys, row: {
-                "date": keys[0],
-                "country": keys[1],
-                "clicks": row["clicks"],
-                "impressions": row["impressions"],
-                "ctr": row["ctr"],
-                "position": row["position"],
-            },
-        )
-        if country_rows:
-            upsert_gsc_country(country_rows)
+    country_rows = _fetch_gsc_dimensioned(
+        service, site_url, start_date, end_date,
+        dimensions=["date", "country"],
+        mapper=lambda keys, row: {
+            "date": keys[0],
+            "country": keys[1],
+            "clicks": row["clicks"],
+            "impressions": row["impressions"],
+            "ctr": row["ctr"],
+            "position": row["position"],
+        },
+    )
+    if country_rows:
+        upsert_gsc_country(country_rows)
 
     # --- Page-level daily aggregates (no query dimension → accurate totals).
     #     GSC drops anonymized-query rows when `query` is a dimension, so the
     #     (date, page, query) sum under-counts vs the GSC UI. This separate
     #     fetch without the query dimension restores the true totals. ---
-    if not page_daily_existed:
-        page_daily_rows = _fetch_gsc_dimensioned(
-            service, site_url, start_date, end_date,
-            dimensions=["date", "page"],
-            mapper=lambda keys, row: {
-                "date": keys[0],
-                "page": keys[1],
-                "clicks": row["clicks"],
-                "impressions": row["impressions"],
-                "ctr": row["ctr"],
-                "position": row["position"],
-            },
-        )
-        if page_daily_rows:
-            upsert_gsc_page_daily(page_daily_rows)
+    page_daily_rows = _fetch_gsc_dimensioned(
+        service, site_url, start_date, end_date,
+        dimensions=["date", "page"],
+        mapper=lambda keys, row: {
+            "date": keys[0],
+            "page": keys[1],
+            "clicks": row["clicks"],
+            "impressions": row["impressions"],
+            "ctr": row["ctr"],
+            "position": row["position"],
+        },
+    )
+    if page_daily_rows:
+        upsert_gsc_page_daily(page_daily_rows)
 
     # --- Main fetch (date × page × query) ---
-    if gsc_existed:
-        sync_gsc_keyword_rankings()
-        return 0, True
-
     all_rows = _fetch_gsc_dimensioned(
         service, site_url, start_date, end_date,
         dimensions=["date", "page", "query"],
@@ -199,7 +179,7 @@ def fetch_gsc_data() -> tuple[int, bool]:
 
     upsert_gsc(all_rows)
     sync_gsc_keyword_rankings()
-    return len(all_rows), False
+    return len(all_rows)
 
 
 def _fetch_gsc_dimensioned(service, site_url, start_date, end_date, dimensions, mapper):
@@ -232,86 +212,74 @@ def _fetch_gsc_dimensioned(service, site_url, start_date, end_date, dimensions, 
     return out
 
 
-def fetch_ga4_data() -> tuple[int, bool]:
-    """Fetch GA4 report data and write to database.
+def fetch_ga4_data(start_date: str, end_date: str) -> int:
+    """Fetch GA4 report data for the given range and upsert to DB.
 
-    Returns (row_count, already_existed).
+    Returns row count for the main (date × page × source × medium) table.
     """
     property_id = get_ga4_property_id()
     if not property_id:
         raise RuntimeError("GA4_PROPERTY_ID not set in .env")
 
-    start_date, end_date = _date_range()
-
     from db import (
-        latest_data_date,
         upsert_ga4,
         upsert_ga4_traffic,
         upsert_ga4_events,
     )
 
-    end_date_obj = date.fromisoformat(end_date)
     credentials = _get_credentials(GA4_SCOPES)
     client = BetaAnalyticsDataClient(credentials=credentials)
 
     not_jobs = _not_jobs_filter()
 
     # --- Source+medium-level traffic with user counts ---
-    traffic_latest = latest_data_date("ga4_traffic")
-    if traffic_latest is None or traffic_latest < end_date_obj:
-        traffic_rows = _fetch_ga4_report(
-            client, property_id, start_date, end_date,
-            dimensions=["date", "sessionSource", "sessionMedium"],
-            metrics=["sessions", "totalUsers", "activeUsers"],
-            mapper=lambda dims, metrics: {
-                "date": _ga4_date(dims[0]),
-                "session_source": dims[1],
-                "session_medium": dims[2],
-                "sessions": int(metrics[0]),
-                "total_users": int(metrics[1]),
-                "active_users": int(metrics[2]),
-            },
-        )
-        if traffic_rows:
-            upsert_ga4_traffic(traffic_rows)
+    traffic_rows = _fetch_ga4_report(
+        client, property_id, start_date, end_date,
+        dimensions=["date", "sessionSource", "sessionMedium"],
+        metrics=["sessions", "totalUsers", "activeUsers"],
+        mapper=lambda dims, metrics: {
+            "date": _ga4_date(dims[0]),
+            "session_source": dims[1],
+            "session_medium": dims[2],
+            "sessions": int(metrics[0]),
+            "total_users": int(metrics[1]),
+            "active_users": int(metrics[2]),
+        },
+    )
+    if traffic_rows:
+        upsert_ga4_traffic(traffic_rows)
 
     # --- Tracked events by channel group ---
-    events_latest = latest_data_date("ga4_events")
-    if events_latest is None or events_latest < end_date_obj:
-        event_filter = FilterExpression(
-            and_group=FilterExpressionList(expressions=[
-                FilterExpression(
-                    or_group=FilterExpressionList(expressions=[
-                        FilterExpression(filter=Filter(
-                            field_name="eventName",
-                            string_filter=Filter.StringFilter(value=name),
-                        ))
-                        for name in TRACKED_EVENT_NAMES
-                    ])
-                ),
-                not_jobs,
-            ])
-        )
-        event_rows = _fetch_ga4_report(
-            client, property_id, start_date, end_date,
-            dimensions=["date", "eventName", "sessionPrimaryChannelGroup"],
-            metrics=["eventCount"],
-            dimension_filter=event_filter,
-            mapper=lambda dims, metrics: {
-                "date": _ga4_date(dims[0]),
-                "event_name": dims[1],
-                "session_primary_channel_group": dims[2],
-                "event_count": int(metrics[0]),
-            },
-        )
-        if event_rows:
-            upsert_ga4_events(event_rows)
+    event_filter = FilterExpression(
+        and_group=FilterExpressionList(expressions=[
+            FilterExpression(
+                or_group=FilterExpressionList(expressions=[
+                    FilterExpression(filter=Filter(
+                        field_name="eventName",
+                        string_filter=Filter.StringFilter(value=name),
+                    ))
+                    for name in TRACKED_EVENT_NAMES
+                ])
+            ),
+            not_jobs,
+        ])
+    )
+    event_rows = _fetch_ga4_report(
+        client, property_id, start_date, end_date,
+        dimensions=["date", "eventName", "sessionPrimaryChannelGroup"],
+        metrics=["eventCount"],
+        dimension_filter=event_filter,
+        mapper=lambda dims, metrics: {
+            "date": _ga4_date(dims[0]),
+            "event_name": dims[1],
+            "session_primary_channel_group": dims[2],
+            "event_count": int(metrics[0]),
+        },
+    )
+    if event_rows:
+        upsert_ga4_events(event_rows)
 
-    # --- Main page-level sessions fetch (existing ga4 table) ---
-    ga4_latest = latest_data_date("ga4")
-    if ga4_latest is not None and ga4_latest >= end_date_obj:
-        return 0, True
-
+    # --- Main page-level sessions fetch ---
     all_rows = _fetch_ga4_report(
         client, property_id, start_date, end_date,
         dimensions=["date", "pagePath", "sessionSource", "sessionMedium"],
@@ -333,7 +301,7 @@ def fetch_ga4_data() -> tuple[int, bool]:
         )
 
     upsert_ga4(all_rows)
-    return len(all_rows), False
+    return len(all_rows)
 
 
 def _ga4_date(raw: str) -> str:
