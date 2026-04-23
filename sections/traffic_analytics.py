@@ -101,6 +101,37 @@ def _load_ga4_landing_pages() -> pd.DataFrame | None:
 
 
 @st.cache_data(ttl=300, max_entries=1)
+def _load_ga4_category_sessions() -> pd.DataFrame | None:
+    """Per-category session counts with source breakdown (GA4 server-side dedup per category)."""
+    df = query_df(
+        "SELECT date, page_category, session_source, session_medium, sessions "
+        "FROM ga4_category_sessions "
+        "WHERE date >= CURRENT_DATE - INTERVAL '56 days' ORDER BY date"
+    )
+    if df.empty:
+        return None
+    df["date"] = pd.to_datetime(df["date"])
+    df["sessions"] = pd.to_numeric(df["sessions"], errors="coerce").fillna(0).astype(int)
+    df["session_source"] = df["session_source"].astype("category")
+    return df
+
+
+@st.cache_data(ttl=300, max_entries=1)
+def _load_ga4_traffic_weekly() -> pd.DataFrame | None:
+    """Weekly user acquisition aggregates by firstUserSource (matches GA4 User Acquisition report)."""
+    df = query_df(
+        "SELECT date, first_user_source, first_user_medium, total_users, new_users "
+        "FROM ga4_traffic_weekly WHERE date >= CURRENT_DATE - INTERVAL '56 days' ORDER BY date"
+    )
+    if df.empty:
+        return None
+    df["date"] = pd.to_datetime(df["date"])
+    df["first_user_source"] = df["first_user_source"].astype("category")
+    df["first_user_medium"] = df["first_user_medium"].astype("category")
+    return df
+
+
+@st.cache_data(ttl=300, max_entries=1)
 def _load_ga4_events() -> pd.DataFrame | None:
     """Tracked event counts by channel group."""
     df = query_df(
@@ -137,6 +168,8 @@ def render():
     df = _load_all_ga4_data()
     df_src = _load_ga4_traffic()
     df_lp = _load_ga4_landing_pages()
+    df_cat = _load_ga4_category_sessions()
+    lp_cat_latest = None  # set below once date range is known
 
     if df is None:
         uploaded = st.file_uploader(
@@ -363,41 +396,124 @@ def render():
     render_chart_insight("source_trend", src_trend_text, "What's driving changes in traffic sources?")
 
     # --- Page category breakdown (latest period with change) ---
+    # Entry Sessions  = sessions that started on a category page (ga4_landing_pages).
+    # Total Sessions  = sessions that visited any page in the category, GA4-accurate
+    #                   (ga4_category_sessions, fetched with per-category server-side filters).
+    # Other (Total)   = ga4_traffic total − sum of all named-category totals.
     st.subheader(f"Sessions by Page Category ({period_range_label})")
 
-    cat_latest = (
-        df_latest.groupby("page_category")["sessions"]
-        .sum()
-        .reset_index()
-        .sort_values("sessions", ascending=False)
-    )
+    if df_lp is not None:
+        lp_cat_latest = _slice(df_lp, curr_start, curr_end)
+        lp_cat_prev_raw = _slice(df_lp, prev_start, prev_end)
+        lp_cat_prev = lp_cat_prev_raw if not lp_cat_prev_raw.empty else None
+    else:
+        lp_cat_latest = None
+        lp_cat_prev = None
 
-    if df_prev is not None:
-        cat_prev = (
-            df_prev.groupby("page_category")["sessions"]
-            .sum()
-            .reset_index()
-            .rename(columns={"sessions": "sessions_prev"})
+    # Entry sessions per category
+    if lp_cat_latest is not None:
+        entry_latest = (
+            lp_cat_latest.groupby("page_category", observed=True)["sessions"]
+            .sum().reset_index()
+            .rename(columns={"sessions": "entry_sessions"})
         )
-        cat_latest = cat_latest.merge(cat_prev, on="page_category", how="left").fillna(0)
-        cat_latest["change"] = cat_latest.apply(
-            lambda r: f"{(r['sessions'] - r['sessions_prev']) / r['sessions_prev'] * 100:+.0f}%"
-            if r["sessions_prev"] > 0 else "new",
-            axis=1,
-        )
+        entry_prev = (
+            lp_cat_prev.groupby("page_category", observed=True)["sessions"]
+            .sum().reset_index()
+            .rename(columns={"sessions": "entry_prev"})
+        ) if lp_cat_prev is not None else None
+    else:
+        entry_latest = None
+        entry_prev = None
 
-    cat_display = {"page_category": "Page Category", "sessions": "Sessions"}
-    if df_prev is not None:
-        cat_display["change"] = "Change"
-    st.dataframe(
-        cat_latest[list(cat_display.keys())].rename(columns=cat_display),
-        hide_index=True,
-        width="stretch",
-    )
+    # Total sessions per category (GA4-accurate)
+    if df_cat is not None:
+        cat_latest_raw = _slice(df_cat, curr_start, curr_end)
+        cat_prev_raw = _slice(df_cat, prev_start, prev_end)
+
+        total_latest = (
+            cat_latest_raw.groupby("page_category")["sessions"]
+            .sum().reset_index()
+            .rename(columns={"sessions": "total_sessions"})
+        )
+        total_prev = (
+            cat_prev_raw.groupby("page_category")["sessions"]
+            .sum().reset_index()
+            .rename(columns={"sessions": "total_prev"})
+        ) if not cat_prev_raw.empty else None
+
+        # Compute Other = ga4_traffic total − named category sum
+        traffic_total = int(df_src_latest["sessions"].sum()) if df_src is not None else 0
+        named_total = int(total_latest["total_sessions"].sum())
+        other_total = max(0, traffic_total - named_total)
+        other_row = pd.DataFrame([{"page_category": "Other", "total_sessions": other_total}])
+        total_latest = pd.concat([total_latest, other_row], ignore_index=True)
+
+        if total_prev is not None:
+            traffic_total_prev = int(_slice(df_src, prev_start, prev_end)["sessions"].sum()) if df_src is not None else 0
+            named_total_prev = int(total_prev["total_prev"].sum())
+            other_prev = max(0, traffic_total_prev - named_total_prev)
+            total_prev = pd.concat([
+                total_prev,
+                pd.DataFrame([{"page_category": "Other", "total_prev": other_prev}])
+            ], ignore_index=True)
+    else:
+        total_latest = None
+        total_prev = None
+
+    # Merge entry + total, sort by total sessions
+    if total_latest is not None and entry_latest is not None:
+        cat_table = total_latest.merge(entry_latest, on="page_category", how="outer").fillna(0)
+    elif total_latest is not None:
+        cat_table = total_latest.copy()
+        cat_table["entry_sessions"] = 0
+    elif entry_latest is not None:
+        cat_table = entry_latest.rename(columns={"entry_sessions": "entry_sessions"})
+        cat_table["total_sessions"] = 0
+    else:
+        cat_table = None
+
+    if cat_table is not None:
+        cat_table = cat_table.sort_values("total_sessions", ascending=False)
+
+        # Period-over-period change columns
+        if total_prev is not None:
+            cat_table = cat_table.merge(total_prev, on="page_category", how="left").fillna(0)
+            cat_table["total_change"] = cat_table.apply(
+                lambda r: f"{(r['total_sessions'] - r['total_prev']) / r['total_prev'] * 100:+.0f}%"
+                if r["total_prev"] > 0 else "new", axis=1,
+            )
+        if entry_prev is not None:
+            cat_table = cat_table.merge(entry_prev, on="page_category", how="left").fillna(0)
+            cat_table["entry_change"] = cat_table.apply(
+                lambda r: f"{(r['entry_sessions'] - r['entry_prev']) / r['entry_prev'] * 100:+.0f}%"
+                if r["entry_prev"] > 0 else "new", axis=1,
+            )
+
+        col_map = {"page_category": "Page Category"}
+        if "total_sessions" in cat_table.columns:
+            col_map["total_sessions"] = "Total Sessions"
+        if "total_change" in cat_table.columns:
+            col_map["total_change"] = "Total Δ"
+        if "entry_sessions" in cat_table.columns:
+            col_map["entry_sessions"] = "Entry Sessions"
+        if "entry_change" in cat_table.columns:
+            col_map["entry_change"] = "Entry Δ"
+
+        st.dataframe(
+            cat_table[list(col_map.keys())].rename(columns=col_map),
+            hide_index=True,
+            width="stretch",
+        )
+        st.caption(
+            "**Total Sessions** — sessions that visited any page in the category (matches GA4 Traffic Acquisition with page filter). "
+            "**Entry Sessions** — sessions that started on a category page."
+        )
+    else:
+        st.info("Re-fetch data to populate page category session counts.")
 
     # --- Per-source landing page drill-down ---
     st.subheader("Landing Page Breakdown by Source")
-    st.caption("Entry-point sessions only (first page of the session) — totals match the Sessions by Source table above.")
 
     available_sources = source_latest["session_source"].tolist()
     drill_source = st.selectbox(
@@ -408,24 +524,50 @@ def render():
 
     if df_lp is not None:
         lp_latest = _slice(df_lp, curr_start, curr_end)
-        drill_df = (
-            lp_latest[lp_latest["session_source"].astype(str) == drill_source]
-            .groupby("page_category", observed=True)["sessions"]
-            .sum()
-            .reset_index()
-            .sort_values("sessions", ascending=False)
-        )
+        drill_source_df = lp_latest[lp_latest["session_source"].astype(str) == drill_source]
+        lp_col = "landing_page"
     else:
-        drill_df = (
-            df_latest[df_latest["session_source"].astype(str) == drill_source]
-            .groupby("page_category", observed=True)["sessions"]
-            .sum()
-            .reset_index()
-            .sort_values("sessions", ascending=False)
+        drill_source_df = df_latest[df_latest["session_source"].astype(str) == drill_source]
+        lp_col = "page_path"
+
+    drill_df = (
+        drill_source_df
+        .groupby("page_category", observed=True)["sessions"]
+        .sum()
+        .reset_index()
+        .sort_values("sessions", ascending=False)
+    )
+
+    # Show total vs Sessions by Source so any remaining mismatch is visible
+    lp_total = int(drill_df["sessions"].sum())
+    src_total = int(
+        source_latest[source_latest["session_source"].astype(str) == drill_source]["sessions"].sum()
+    )
+    if lp_total != src_total:
+        st.caption(
+            f"Landing page total: {lp_total:,} | Sessions by Source: {src_total:,} — "
+            "re-fetch data to sync (landing page table needs refresh)."
         )
 
+    # Cap chart at top 15 categories; roll the tail into "Other"
+    TOP_CHART = 15
+    if len(drill_df) > TOP_CHART:
+        tail_sessions = int(drill_df.iloc[TOP_CHART:]["sessions"].sum())
+        drill_df_chart = drill_df.head(TOP_CHART).copy()
+        if tail_sessions:
+            other_mask = drill_df_chart["page_category"].astype(str) == "Other"
+            if other_mask.any():
+                drill_df_chart.loc[other_mask, "sessions"] += tail_sessions
+            else:
+                drill_df_chart = pd.concat([
+                    drill_df_chart,
+                    pd.DataFrame([{"page_category": "Other", "sessions": tail_sessions}])
+                ], ignore_index=True)
+    else:
+        drill_df_chart = drill_df
+
     fig_drill = px.bar(
-        drill_df,
+        drill_df_chart,
         x="page_category",
         y="sessions",
         text="sessions",
@@ -436,11 +578,38 @@ def render():
     fig_drill.update_layout(showlegend=False)
     st.plotly_chart(fig_drill, width="stretch")
 
+    # "Other" breakdown table
+    if "Other" in drill_df["page_category"].astype(str).values:
+        other_df = (
+            drill_source_df[drill_source_df["page_category"].astype(str) == "Other"]
+            .groupby(lp_col)["sessions"]
+            .sum()
+            .reset_index()
+            .sort_values("sessions", ascending=False)
+        )
+        with st.expander(f"'Other' breakdown ({other_df['sessions'].sum():,} sessions)", expanded=True):
+            st.dataframe(
+                other_df.rename(columns={lp_col: "Landing Page", "sessions": "Sessions"}),
+                hide_index=True,
+                width="stretch",
+            )
+
     # --- Inverted drill-down: source breakdown by page category ---
     st.subheader("Source Breakdown by Page Category")
 
+    # Use ga4_category_sessions (GA4-accurate) when available, fall back to landing pages
+    if df_cat is not None:
+        _cat_src_base = _slice(df_cat, curr_start, curr_end)
+        _cat_src_col = "session_source"
+    elif lp_cat_latest is not None:
+        _cat_src_base = lp_cat_latest
+        _cat_src_col = "session_source"
+    else:
+        _cat_src_base = df_latest
+        _cat_src_col = "session_source"
+
     available_cats = (
-        df_latest.groupby("page_category")["sessions"]
+        _cat_src_base.groupby("page_category", observed=True)["sessions"]
         .sum()
         .sort_values(ascending=False)
         .index.tolist()
@@ -452,8 +621,8 @@ def render():
     )
 
     cat_source_df = (
-        df_latest[df_latest["page_category"] == drill_cat]
-        .groupby("session_source")["sessions"]
+        _cat_src_base[_cat_src_base["page_category"].astype(str) == str(drill_cat)]
+        .groupby(_cat_src_col, observed=True)["sessions"]
         .sum()
         .reset_index()
         .sort_values("sessions", ascending=False)
@@ -462,11 +631,11 @@ def render():
 
     fig_cat_src = px.bar(
         cat_source_df,
-        x="session_source",
+        x=_cat_src_col,
         y="sessions",
         text="sessions",
         title=f"Top Sources — {drill_cat}",
-        color="session_source",
+        color=_cat_src_col,
     )
     fig_cat_src.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
     fig_cat_src.update_layout(showlegend=False, xaxis_tickangle=-30)
@@ -554,9 +723,14 @@ def render():
         render_chart_insight("geo_trend", geo_trend_text, "What's the AI traffic trajectory and what does it mean?")
 
     # ------------------------------------------------------------------
-    # Users & Visits by source/medium (from ga4_traffic)
+    # Users & Visits by source/medium
+    # Sessions from ga4_traffic (daily, accurate).
+    # User counts from ga4_traffic_weekly (weekly aggregate, accurate —
+    # daily user counts inflate multi-day visitors when summed).
     # ------------------------------------------------------------------
     traffic = _load_ga4_traffic()
+    traffic_weekly = _load_ga4_traffic_weekly()
+
     if traffic is None:
         st.info(
             "No source+medium-level user metrics yet. Click **Fetch GSC + GA4 Data** to populate."
@@ -566,37 +740,68 @@ def render():
         t_prev_raw = _slice(traffic, prev_start, prev_end)
         t_prev = t_prev_raw if not t_prev_raw.empty else None
 
-        def _with_change(df_curr, df_prev_agg, key):
-            agg = (
-                df_curr.groupby(key)[["sessions", "total_users", "active_users"]]
+        # Weekly slices for user acquisition (week-start date falls within the range).
+        tw_latest = _slice(traffic_weekly, curr_start, curr_end) if traffic_weekly is not None else None
+        tw_prev_raw = _slice(traffic_weekly, prev_start, prev_end) if traffic_weekly is not None else None
+        tw_prev = tw_prev_raw if (tw_prev_raw is not None and not tw_prev_raw.empty) else None
+
+        def _users_by_source(df_weekly, src_col="first_user_source"):
+            if df_weekly is None:
+                return None
+            return (
+                df_weekly.groupby(src_col, observed=True)[["total_users", "new_users"]]
                 .sum()
                 .reset_index()
+                .rename(columns={src_col: "source"})
+            )
+
+        def _build_src_table(df_sess, df_sess_prev, df_users, df_users_prev):
+            """Merge Traffic Acquisition sessions with User Acquisition user counts."""
+            sess = (
+                df_sess.groupby("session_source", observed=True)[["sessions"]]
+                .sum().reset_index()
+                .rename(columns={"session_source": "source"})
                 .sort_values("sessions", ascending=False)
             )
-            if df_prev_agg is None:
-                return agg
-            prev = (
-                df_prev_agg.groupby(key)[["sessions", "total_users"]]
-                .sum()
-                .reset_index()
-                .rename(columns={"sessions": "sessions_prev", "total_users": "total_users_prev"})
-            )
-            agg = agg.merge(prev, on=key, how="left").fillna(0)
-            agg["session_change"] = agg.apply(
-                lambda r: f"{(r['sessions'] - r['sessions_prev']) / r['sessions_prev'] * 100:+.0f}%"
-                if r["sessions_prev"] > 0 else "new", axis=1,
-            )
-            agg["user_change"] = agg.apply(
-                lambda r: f"{(r['total_users'] - r['total_users_prev']) / r['total_users_prev'] * 100:+.0f}%"
-                if r["total_users_prev"] > 0 else "new", axis=1,
-            )
-            return agg
+            if df_users is not None:
+                sess = sess.merge(df_users, on="source", how="left").fillna(0)
+            else:
+                sess["total_users"] = 0
+                sess["new_users"] = 0
+
+            if df_sess_prev is not None:
+                prev_s = (
+                    df_sess_prev.groupby("session_source", observed=True)[["sessions"]]
+                    .sum().reset_index()
+                    .rename(columns={"session_source": "source", "sessions": "sessions_prev"})
+                )
+                sess = sess.merge(prev_s, on="source", how="left").fillna(0)
+                sess["session_change"] = sess.apply(
+                    lambda r: f"{(r['sessions'] - r['sessions_prev']) / r['sessions_prev'] * 100:+.0f}%"
+                    if r["sessions_prev"] > 0 else "new", axis=1,
+                )
+            if df_users_prev is not None:
+                prev_u = df_users_prev.rename(columns={"total_users": "total_users_prev"})
+                sess = sess.merge(prev_u[["source", "total_users_prev"]], on="source", how="left").fillna(0)
+                sess["user_change"] = sess.apply(
+                    lambda r: f"{(r['total_users'] - r['total_users_prev']) / r['total_users_prev'] * 100:+.0f}%"
+                    if r["total_users_prev"] > 0 else "new", axis=1,
+                )
+            return sess
+
+        users_latest = _users_by_source(tw_latest)
+        users_prev = _users_by_source(tw_prev)
 
         st.subheader(f"Users & Sessions by Source ({period_range_label})")
-        by_src = _with_change(t_latest, t_prev, "session_source").head(30)
-        cols_src = {"session_source": "Source", "sessions": "Sessions", "total_users": "Total Users", "active_users": "Active Users"}
+        st.caption(
+            "Sessions = Traffic Acquisition (session source). "
+            "Users = User Acquisition (first user source). Matches GA4 report numbers."
+        )
+        by_src = _build_src_table(t_latest, t_prev, users_latest, users_prev).head(30)
+        cols_src = {"source": "Source", "sessions": "Sessions", "total_users": "Total Users", "new_users": "New Users"}
         if "session_change" in by_src.columns:
             cols_src["session_change"] = "Session Δ"
+        if "user_change" in by_src.columns:
             cols_src["user_change"] = "Users Δ"
         st.dataframe(
             by_src[list(cols_src.keys())].rename(columns=cols_src),
@@ -605,20 +810,56 @@ def render():
         )
 
         st.subheader(f"Users & Sessions by Medium ({period_range_label})")
-        by_med = _with_change(t_latest, t_prev, "session_medium")
-        cols_med = {"session_medium": "Medium", "sessions": "Sessions", "total_users": "Total Users", "active_users": "Active Users"}
-        if "session_change" in by_med.columns:
+
+        def _users_by_medium(df_weekly):
+            if df_weekly is None:
+                return None
+            agg = (
+                df_weekly.groupby("first_user_medium", observed=True)[["total_users", "new_users"]]
+                .sum().reset_index()
+            )
+            agg["first_user_medium"] = agg["first_user_medium"].astype(str)
+            return agg.rename(columns={"first_user_medium": "medium"})
+
+        users_by_med_latest = _users_by_medium(tw_latest)
+        users_by_med_prev = _users_by_medium(tw_prev)
+
+        med_sess = (
+            t_latest.groupby("session_medium", observed=True)[["sessions"]]
+            .sum().reset_index().sort_values("sessions", ascending=False)
+        )
+        med_sess["session_medium"] = med_sess["session_medium"].astype(str)
+        med_sess = med_sess.rename(columns={"session_medium": "medium"})
+        if users_by_med_latest is not None:
+            med_sess = med_sess.merge(users_by_med_latest, on="medium", how="left").fillna(0)
+        else:
+            med_sess["total_users"] = 0
+            med_sess["new_users"] = 0
+        if t_prev is not None:
+            prev_med = (
+                t_prev.groupby("session_medium", observed=True)[["sessions"]]
+                .sum().reset_index()
+                .rename(columns={"session_medium": "medium", "sessions": "sessions_prev"})
+            )
+            prev_med["medium"] = prev_med["medium"].astype(str)
+            med_sess = med_sess.merge(prev_med, on="medium", how="left").fillna(0)
+            med_sess["session_change"] = med_sess.apply(
+                lambda r: f"{(r['sessions'] - r['sessions_prev']) / r['sessions_prev'] * 100:+.0f}%"
+                if r["sessions_prev"] > 0 else "new", axis=1,
+            )
+        cols_med = {"medium": "Medium", "sessions": "Sessions", "total_users": "Total Users", "new_users": "New Users"}
+        if "session_change" in med_sess.columns:
             cols_med["session_change"] = "Session Δ"
-            cols_med["user_change"] = "Users Δ"
         st.dataframe(
-            by_med[list(cols_med.keys())].rename(columns=cols_med),
+            med_sess[list(cols_med.keys())].rename(columns=cols_med),
             hide_index=True,
             width="stretch",
         )
 
-        # Users trend — top 8 sources, granularity from the chart toggle.
-        top_users = by_src.head(8)["session_source"].tolist()
-        t_latest_b = _bucket(t_latest, granularity)
+        # Users trend — weekly user acquisition data; top 8 first-user sources.
+        top_users = by_src.head(8)["source"].tolist()
+        trend_base = tw_latest.rename(columns={"first_user_source": "session_source"}) if tw_latest is not None else t_latest
+        t_latest_b = _bucket(trend_base, granularity)
         trend_users = (
             t_latest_b[t_latest_b["session_source"].isin(top_users)]
             .groupby(["bucket", "bucket_label", "session_source"], observed=True)["total_users"]

@@ -15,12 +15,12 @@ from google.analytics.data_v1beta.types import (
     RunReportRequest,
 )
 
-def _not_jobs_filter() -> FilterExpression:
-    """Exclude pages whose path contains /jobs (careers traffic, not marketing)."""
+def _not_jobs_filter(field: str = "pagePath") -> FilterExpression:
+    """Exclude sessions where the given field contains /jobs."""
     return FilterExpression(
         not_expression=FilterExpression(
             filter=Filter(
-                field_name="pagePath",
+                field_name=field,
                 string_filter=Filter.StringFilter(
                     match_type=Filter.StringFilter.MatchType.CONTAINS,
                     value="/jobs",
@@ -28,6 +28,53 @@ def _not_jobs_filter() -> FilterExpression:
                 ),
             )
         )
+    )
+
+
+# Per-category GA4 filter specs: list of (field, match_type, value).
+# Multiple conditions within a category are OR-combined.
+# match_type: "EXACT" | "BEGINS_WITH" | "CONTAINS"
+CATEGORY_FILTERS: dict[str, list[tuple[str, str, str]]] = {
+    "Articles":           [("pagePath", "BEGINS_WITH", "/articles")],
+    "Blog":               [("pagePath", "BEGINS_WITH", "/blog")],
+    "Maxim Docs":         [("pagePath", "BEGINS_WITH", "/docs")],
+    "Features":           [("pagePath", "BEGINS_WITH", "/features")],
+    "Pricing":            [("pagePath", "BEGINS_WITH", "/pricing"),
+                           ("pagePath", "EXACT",       "/bifrost/pricing")],
+    "LLM Cost Calculator":[("pagePath", "BEGINS_WITH", "/bifrost/llm-cost-calculator"),
+                           ("pagePath", "BEGINS_WITH", "/llm-cost-calculator")],
+    "Comparison Pages":   [("pagePath", "BEGINS_WITH", "/compare")],
+    "Products":           [("pagePath", "BEGINS_WITH", "/products")],
+    "Resources":          [("pagePath", "BEGINS_WITH", "/resources")],
+    "Alternatives":       [("pagePath", "BEGINS_WITH", "/alternatives")],
+    "Industry Pages":     [("pagePath", "BEGINS_WITH", "/industry")],
+    "Provider Status":    [("pagePath", "BEGINS_WITH", "/provider-status")],
+    "Model Library":      [("pagePath", "BEGINS_WITH", "/model-library")],
+    "Bifrost Docs":       [("hostName", "EXACT",       "docs.getbifrost.ai")],
+    "Maxim Homepage":     [("pagePath", "EXACT",       "/")],
+    "Bifrost Enterprise": [("pagePath", "EXACT",       "/enterprise")],
+    "Bifrost":            [("pagePath", "EXACT",       "/bifrost"),
+                           ("pagePath", "EXACT",       "/bifrost/enterprise"),
+                           ("pagePath", "EXACT",       "/bifrost/book-a-demo")],
+}
+
+
+def _build_category_filter(conditions: list[tuple[str, str, str]]) -> FilterExpression:
+    """Build an OR-combined FilterExpression from a list of (field, match_type, value)."""
+    _mt = {
+        "EXACT":       Filter.StringFilter.MatchType.EXACT,
+        "BEGINS_WITH": Filter.StringFilter.MatchType.BEGINS_WITH,
+        "CONTAINS":    Filter.StringFilter.MatchType.CONTAINS,
+    }
+    exprs = [
+        FilterExpression(filter=Filter(
+            field_name=field,
+            string_filter=Filter.StringFilter(match_type=_mt[mt], value=value),
+        ))
+        for field, mt, value in conditions
+    ]
+    return exprs[0] if len(exprs) == 1 else FilterExpression(
+        or_group=FilterExpressionList(expressions=exprs)
     )
 
 
@@ -232,9 +279,9 @@ def fetch_ga4_data(start_date: str, end_date: str) -> int:
     credentials = _get_credentials(GA4_SCOPES)
     client = BetaAnalyticsDataClient(credentials=credentials)
 
-    not_jobs = _not_jobs_filter()
+    not_jobs = _not_jobs_filter("pagePath")
 
-    # --- Source+medium-level traffic with user counts + engagement ---
+    # --- Source+medium-level traffic (daily) — accurate sessions, inflated user counts ---
     traffic_rows = _fetch_ga4_report(
         client, property_id, start_date, end_date,
         dimensions=["date", "sessionSource", "sessionMedium"],
@@ -253,7 +300,11 @@ def fetch_ga4_data(start_date: str, end_date: str) -> int:
         },
     )
     if traffic_rows:
+        from db import upsert_ga4_traffic
         upsert_ga4_traffic(traffic_rows)
+
+    # --- Weekly traffic aggregates (no date dim) — accurate user counts for periods ---
+    _fetch_ga4_traffic_weekly(client, property_id, start_date, end_date)
 
     # --- Tracked events by channel group ---
     event_filter = FilterExpression(
@@ -320,7 +371,7 @@ def fetch_ga4_data(start_date: str, end_date: str) -> int:
         dimensions=["date", "landingPage", "sessionSource", "sessionMedium"],
         metrics=["sessions", "engagedSessions", "newUsers", "userEngagementDuration",
                  "conversions"],
-        dimension_filter=not_jobs,
+        dimension_filter=None,
         mapper=lambda dims, metrics: {
             "date": _ga4_date(dims[0]),
             "landing_page": dims[1],
@@ -369,6 +420,126 @@ def fetch_ga4_data(start_date: str, end_date: str) -> int:
     if page_event_rows:
         upsert_ga4_page_events(page_event_rows)
 
+    # --- Per-category session counts (one filtered query per category) ---
+    fetch_ga4_category_sessions(start_date, end_date, client=client, property_id=property_id)
+
+    return len(all_rows)
+
+
+def _fetch_ga4_traffic_weekly(client, property_id: str, start_date: str, end_date: str):
+    """Fetch weekly user acquisition aggregates using firstUserSource dimension.
+
+    Uses firstUserSource/firstUserMedium (User Acquisition report) without the
+    date dimension so GA4 deduplicates users across the week server-side.
+    Sessions stay in ga4_traffic (Traffic Acquisition / sessionSource).
+    Week-start date stored as the row's date.
+    """
+    from datetime import date as _date, timedelta
+    from db import upsert_ga4_traffic_weekly, get_pool
+
+    start = _date.fromisoformat(start_date)
+    end = _date.fromisoformat(end_date)
+    weeks: list[tuple[_date, _date]] = []
+    wk = start
+    while wk <= end:
+        weeks.append((wk, min(wk + timedelta(days=6), end)))
+        wk += timedelta(days=7)
+
+    all_rows = []
+    for week_start, week_end in weeks:
+        rows = _fetch_ga4_report(
+            client, property_id,
+            week_start.isoformat(), week_end.isoformat(),
+            dimensions=["firstUserSource", "firstUserMedium"],
+            metrics=["totalUsers", "newUsers"],
+            mapper=lambda dims, metrics, d=week_start: {
+                "date": d.isoformat(),
+                "first_user_source": dims[0],
+                "first_user_medium": dims[1],
+                "total_users": int(metrics[0]),
+                "new_users": int(metrics[1]),
+            },
+        )
+        all_rows.extend(rows)
+
+    if all_rows:
+        pool = get_pool()
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM ga4_traffic_weekly WHERE date >= %s AND date <= %s",
+                    (start_date, end_date),
+                )
+            conn.commit()
+        upsert_ga4_traffic_weekly(all_rows)
+
+
+def fetch_ga4_category_sessions(
+    start_date: str,
+    end_date: str,
+    client=None,
+    property_id: str | None = None,
+) -> int:
+    """Fetch GA4 sessions per page category using per-category page filters.
+
+    Fetches each 7-day week separately without the date dimension to avoid
+    GA4 privacy thresholds that silently drop small (date, source, medium)
+    buckets. The week-start date is stored as the row's date.
+    'Other' is derived at display time as total_sessions − sum(categories).
+    """
+    from datetime import date as _date, timedelta
+    from db import upsert_ga4_category_sessions
+
+    if client is None:
+        credentials = _get_credentials(GA4_SCOPES)
+        client = BetaAnalyticsDataClient(credentials=credentials)
+    if property_id is None:
+        property_id = get_ga4_property_id()
+    if not property_id:
+        raise RuntimeError("GA4_PROPERTY_ID not set in .env")
+
+    # Split range into 7-day weeks; store week-start as the date.
+    start = _date.fromisoformat(start_date)
+    end = _date.fromisoformat(end_date)
+    weeks: list[tuple[_date, _date]] = []
+    wk = start
+    while wk <= end:
+        weeks.append((wk, min(wk + timedelta(days=6), end)))
+        wk += timedelta(days=7)
+
+    all_rows = []
+    for week_start, week_end in weeks:
+        for category, conditions in CATEGORY_FILTERS.items():
+            dim_filter = _build_category_filter(conditions)
+            rows = _fetch_ga4_report(
+                client, property_id,
+                week_start.isoformat(), week_end.isoformat(),
+                dimensions=["sessionSource", "sessionMedium"],
+                metrics=["sessions"],
+                dimension_filter=dim_filter,
+                mapper=lambda dims, metrics, cat=category, d=week_start: {
+                    "date": d.isoformat(),
+                    "page_category": cat,
+                    "session_source": dims[0],
+                    "session_medium": dims[1],
+                    "sessions": int(metrics[0]),
+                },
+            )
+            all_rows.extend(rows)
+
+    if all_rows:
+        # Delete existing rows for this range (handles transition from per-day
+        # to per-week storage — old daily rows would otherwise linger).
+        from db import get_pool
+        pool = get_pool()
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM ga4_category_sessions WHERE date >= %s AND date <= %s",
+                    (start_date, end_date),
+                )
+            conn.commit()
+        upsert_ga4_category_sessions(all_rows)
     return len(all_rows)
 
 

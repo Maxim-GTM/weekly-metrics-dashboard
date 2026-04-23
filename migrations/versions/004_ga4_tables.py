@@ -1,8 +1,8 @@
-"""GA4 content analytics: engagement columns + landing pages + page events tables.
+"""GA4 tables: engagement columns, landing pages, page events, exits, conversions.
 
 Revision ID: 004
 Revises: 003
-Create Date: 2026-04-22
+Create Date: 2026-04-23
 """
 
 from alembic import op
@@ -14,15 +14,15 @@ depends_on = None
 
 
 def upgrade():
-    # --- Add engagement columns to existing ga4 page-level table ---
     op.execute("""
         ALTER TABLE ga4
             ADD COLUMN IF NOT EXISTS engaged_sessions       INTEGER NOT NULL DEFAULT 0,
             ADD COLUMN IF NOT EXISTS engagement_duration_s  INTEGER NOT NULL DEFAULT 0,
-            ADD COLUMN IF NOT EXISTS new_users              INTEGER NOT NULL DEFAULT 0
+            ADD COLUMN IF NOT EXISTS new_users              INTEGER NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS exits                  INTEGER NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS conversions            INTEGER NOT NULL DEFAULT 0
     """)
 
-    # --- Add engagement + new user columns to ga4_traffic source-level table ---
     op.execute("""
         ALTER TABLE ga4_traffic
             ADD COLUMN IF NOT EXISTS engaged_sessions       INTEGER NOT NULL DEFAULT 0,
@@ -30,7 +30,6 @@ def upgrade():
             ADD COLUMN IF NOT EXISTS engagement_duration_s  INTEGER NOT NULL DEFAULT 0
     """)
 
-    # --- Landing page table: entry-point sessions distinct from pagePath ---
     op.execute("""
         CREATE TABLE ga4_landing_pages (
             date                    DATE    NOT NULL,
@@ -41,12 +40,12 @@ def upgrade():
             engaged_sessions        INTEGER NOT NULL DEFAULT 0,
             new_users               INTEGER NOT NULL DEFAULT 0,
             engagement_duration_s   INTEGER NOT NULL DEFAULT 0,
+            conversions             INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (date, landing_page, session_source, session_medium)
         );
         CREATE INDEX idx_ga4_landing_pages_date ON ga4_landing_pages (date);
     """)
 
-    # --- Page-level events: scroll depth and other enhanced measurement events ---
     op.execute("""
         CREATE TABLE ga4_page_events (
             date        DATE    NOT NULL,
@@ -73,5 +72,7 @@ def downgrade():
         ALTER TABLE ga4
             DROP COLUMN IF EXISTS engaged_sessions,
             DROP COLUMN IF EXISTS engagement_duration_s,
-            DROP COLUMN IF EXISTS new_users
+            DROP COLUMN IF EXISTS new_users,
+            DROP COLUMN IF EXISTS exits,
+            DROP COLUMN IF EXISTS conversions
     """)

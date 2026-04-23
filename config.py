@@ -13,22 +13,44 @@ PAGE_CATEGORIES = {
     "/articles": "Articles",
     "/blog": "Blog",
     "/compare": "Comparison Pages",
-    "/docs": "Docs",
+    "/docs": "Maxim Docs",
     "/products": "Products",
-    "/bifrost/llm-cost-calculator": "LLM Cost Calculator",  # must precede /bifrost
-    "/bifrost": "Bifrost",
+    "/bifrost/llm-cost-calculator": "LLM Cost Calculator",
     "/llm-cost-calculator": "LLM Cost Calculator",
     "/provider-status": "Provider Status",
     "/model-library": "Model Library",
     "/resources": "Resources",
     "/alternatives": "Alternatives",
     "/industry": "Industry Pages",
+    "/pricing": "Pricing",
+    "/features": "Features",
+    # Bifrost documentation (docs.bifrost.ai paths tracked under same GA4 property)
+    "/overview": "Bifrost Docs",
+    "/quickstart": "Bifrost Docs",
+    "/mcp": "Bifrost Docs",
+    "/providers": "Bifrost Docs",
+    "/deployment-guides": "Bifrost Docs",
+    "/api-reference": "Bifrost Docs",
+    "/integrations": "Bifrost Docs",
+    "/architecture": "Bifrost Docs",
+    "/plugins": "Bifrost Docs",
+    "/models-catalog": "Bifrost Docs",
+    "/evals-handbook": "Bifrost Docs",
+    "/contributing": "Bifrost Docs",
+    "/benchmarking": "Bifrost Docs",
+    "/migration-guides": "Bifrost Docs",
+    "/cli-agents": "Bifrost Docs",
+    "/changelogs": "Bifrost Docs",
 }
 
-# These are matched separately since they don't follow the path-prefix pattern.
+# Exact-match pages (checked before prefix matching).
 SPECIAL_PAGES = {
     "/": "Maxim Homepage",
     "/enterprise": "Bifrost Enterprise",
+    "/bifrost": "Bifrost",
+    "/bifrost/enterprise": "Bifrost",
+    "/bifrost/book-a-demo": "Bifrost",
+    "/bifrost/pricing": "Pricing",
 }
 
 
@@ -36,6 +58,9 @@ def categorize_page(page_path: str) -> str:
     """Map a URL path to its page category."""
     if not isinstance(page_path, str) or not page_path:
         return "Other"
+
+    # Strip query string — GA4's landingPage dimension includes query params
+    page_path = page_path.split("?")[0]
 
     # Check special pages first (exact match)
     for pattern, name in SPECIAL_PAGES.items():
@@ -53,7 +78,7 @@ def categorize_page(page_path: str) -> str:
 # Top-level prefixes where the 2nd path segment is a meaningful subcategory.
 # e.g. /bifrost/resources/xyz → "Bifrost > resources", but /articles/<slug>
 # stays just "Articles" (slug is unique per page, drill-down is noise).
-DEEP_CATEGORY_PREFIXES = {"/bifrost", "/compare"}
+DEEP_CATEGORY_PREFIXES = {"/compare"}
 
 
 def categorize_page_deep(page_path: str) -> str:

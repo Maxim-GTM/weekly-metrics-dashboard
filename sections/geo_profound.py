@@ -420,7 +420,7 @@ def render():
         top_gap = top_gap.sort_values("gap")
         top_gap["label"] = top_gap["prompt"].str[:60]
         top_gap["direction"] = top_gap["gap"].apply(
-            lambda v: "Cited, not mentioned" if v > 0 else "Mentioned, not cited"
+            lambda v: "Cited, not mentioned" if v > 0
         )
         fig_gap = px.bar(
             top_gap,
@@ -431,7 +431,6 @@ def render():
             title="Top 20 prompts by citation-vs-mention gap (percentage points)",
             color_discrete_map={
                 "Cited, not mentioned": "#14b8a6",
-                "Mentioned, not cited": "#ef4444",
             },
             labels={"gap": "Citation rate − Mention rate (pp)", "label": ""},
         )
