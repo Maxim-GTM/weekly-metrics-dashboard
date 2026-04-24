@@ -477,9 +477,12 @@ def _fetch_ga4_traffic_weekly(client, property_id: str, start_date: str, end_dat
     """
     from datetime import date as _date, timedelta
     from db import upsert_ga4_traffic_weekly, get_pool
+    from config import week_start as _week_start
 
-    start = _date.fromisoformat(start_date)
     end = _date.fromisoformat(end_date)
+    # Snap to the Sunday that opens the first affected week so stored dates are
+    # always Sundays regardless of what day the cron runs.
+    start = _week_start(_date.fromisoformat(start_date))
     weeks: list[tuple[_date, _date]] = []
     wk = start
     while wk <= end:
@@ -510,7 +513,7 @@ def _fetch_ga4_traffic_weekly(client, property_id: str, start_date: str, end_dat
             with conn.cursor() as cur:
                 cur.execute(
                     "DELETE FROM ga4_traffic_weekly WHERE date >= %s AND date <= %s",
-                    (start_date, end_date),
+                    (start.isoformat(), end_date),
                 )
             conn.commit()
         upsert_ga4_traffic_weekly(all_rows)
@@ -531,6 +534,7 @@ def fetch_ga4_category_sessions(
     """
     from datetime import date as _date, timedelta
     from db import upsert_ga4_category_sessions
+    from config import week_start as _week_start
 
     if client is None:
         credentials = _get_credentials(GA4_SCOPES)
@@ -540,9 +544,10 @@ def fetch_ga4_category_sessions(
     if not property_id:
         raise RuntimeError("GA4_PROPERTY_ID not set in .env")
 
-    # Split range into 7-day weeks; store week-start as the date.
-    start = _date.fromisoformat(start_date)
+    # Snap to the Sunday opening the first affected week so stored dates are
+    # always Sundays regardless of what day the cron runs.
     end = _date.fromisoformat(end_date)
+    start = _week_start(_date.fromisoformat(start_date))
     weeks: list[tuple[_date, _date]] = []
     wk = start
     while wk <= end:
@@ -570,15 +575,13 @@ def fetch_ga4_category_sessions(
             all_rows.extend(rows)
 
     if all_rows:
-        # Delete existing rows for this range (handles transition from per-day
-        # to per-week storage — old daily rows would otherwise linger).
         from db import get_pool
         pool = get_pool()
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "DELETE FROM ga4_category_sessions WHERE date >= %s AND date <= %s",
-                    (start_date, end_date),
+                    (start.isoformat(), end_date),
                 )
             conn.commit()
         upsert_ga4_category_sessions(all_rows)

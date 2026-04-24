@@ -2,6 +2,7 @@
 
 import json
 import os
+from datetime import date as _date, timedelta as _timedelta
 
 from dotenv import load_dotenv
 
@@ -174,6 +175,11 @@ TOPIC_COMPETITORS = {
     "Bifrost": ["litellm", "portkey"],
     "Maxim": ["langfuse", "langsmith", "braintrust", "arize", "helicone"],
 }
+
+def week_start(d: _date) -> _date:
+    """Return the Sunday that begins the Sun–Sat week containing d."""
+    return d - _timedelta(days=d.isoweekday() % 7)
+
 
 def get_database_url() -> str | None:
     """Return DATABASE_URL from environment, or None if not set."""
