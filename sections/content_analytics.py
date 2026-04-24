@@ -1,5 +1,5 @@
 """Content Analytics — engagement quality, channel comparison, landing pages,
-conversions, dropoff analysis, and scroll depth."""
+conversions, and dropoff analysis."""
 
 from datetime import timedelta
 
@@ -20,12 +20,6 @@ _NAV_PATTERNS = r"/author/|/tag/|/page/\d"
 
 def _drop_nav_pages(df: pd.DataFrame, path_col: str = "page_path") -> pd.DataFrame:
     return df[~df[path_col].str.contains(_NAV_PATTERNS, na=False, regex=True)]
-
-CONVERSION_EVENTS = [
-    "bifrost_homepage_enterprise_form_submit",
-    "bifrost_demo_form_submit",
-    "bifrost_enterprise_page_form_submit",
-]
 
 DRILL_DIMENSIONS = {
     "Sessions": "sessions",
@@ -97,35 +91,7 @@ def _load_landing_pages() -> pd.DataFrame | None:
     return df
 
 
-@st.cache_data(ttl=300)
-def _load_events() -> pd.DataFrame | None:
-    df = query_df(
-        "SELECT date, event_name, session_primary_channel_group, event_count "
-        "FROM ga4_events WHERE date >= CURRENT_DATE - INTERVAL '90 days' ORDER BY date"
-    )
-    if df.empty:
-        return None
-    df["date"] = pd.to_datetime(df["date"])
-    df["event_count"] = pd.to_numeric(df["event_count"], errors="coerce").fillna(0).astype(int)
-    return df
 
-
-@st.cache_data(ttl=300)
-def _load_page_events() -> pd.DataFrame | None:
-    df = query_df(
-        "SELECT date, page_path, event_name, event_count "
-        "FROM ga4_page_events "
-        "WHERE date >= CURRENT_DATE - INTERVAL '90 days' "
-        "AND event_name IN ('scroll', 'page_view') "
-        "ORDER BY date"
-    )
-    if df.empty:
-        return None
-    df = _drop_nav_pages(df)
-    df["date"] = pd.to_datetime(df["date"])
-    df["page_category"] = df["page_path"].apply(categorize_page).astype("category")
-    df["event_count"] = pd.to_numeric(df["event_count"], errors="coerce").fillna(0).astype(int)
-    return df
 
 
 def _derive_metrics(agg: pd.DataFrame) -> pd.DataFrame:
@@ -173,8 +139,6 @@ def render():
     df = _load_ga4()
     df_src = _load_traffic()
     df_lp = _load_landing_pages()
-    df_ev = _load_events()
-    df_pe = _load_page_events()
 
     if df is None:
         st.info("No GA4 data yet. Fetch data or check your GA4 configuration.")
@@ -205,8 +169,6 @@ def render():
         "Content Quality",
         "Channel Quality",
         "Landing Pages",
-        "Conversions & Dropoffs",
-        "Scroll Depth",
     ])
 
     # =========================================================================
@@ -408,6 +370,77 @@ def render():
         if analyse_key in st.session_state and st.session_state[analyse_key]:
             st.info(st.session_state[analyse_key])
 
+        st.divider()
+
+        # --- Dropoff pages ---
+        st.subheader("Top Dropoff Pages")
+        st.caption(
+            "High-traffic pages with high bounce rate (low engagement) and zero conversions. "
+            "Pages that appear in converting sessions are excluded — these are pure dead ends."
+        )
+
+        page_bounce = (
+            df_f.groupby("page_path")
+            .agg(
+                sessions=("sessions", "sum"),
+                engaged_sessions=("engaged_sessions", "sum"),
+                engagement_duration_s=("engagement_duration_s", "sum"),
+                conversions=("conversions", "sum"),
+            )
+            .reset_index()
+        )
+        page_bounce = _derive_metrics(page_bounce[page_bounce["sessions"] >= 20])
+        page_bounce["page_category"] = page_bounce["page_path"].apply(categorize_page)
+
+        converting_pages = set(page_bounce[page_bounce["conversions"] > 0]["page_path"].tolist())
+        dropoff_pages = page_bounce[
+            (~page_bounce["page_path"].isin(converting_pages)) &
+            (page_bounce["bounce_rate"] >= 0.5)
+        ].sort_values("sessions", ascending=False).head(30)
+
+        top_conv_for_ref = page_bounce[
+            page_bounce["page_path"].isin(converting_pages)
+        ].sort_values("conversions", ascending=False).head(10)
+
+        if dropoff_pages.empty:
+            st.info("No dropoff pages found for the selected period.")
+        else:
+            fig_drop = px.bar(
+                dropoff_pages.head(20).sort_values("sessions", ascending=True),
+                x="sessions", y="page_path", orientation="h",
+                labels={"sessions": "Sessions", "page_path": "Page"},
+                title="Top 20 Dropoff Pages — high traffic, high bounce, zero conversions",
+            )
+            st.plotly_chart(fig_drop, use_container_width=True)
+
+            display_drop = dropoff_pages[[
+                "page_path", "page_category", "sessions",
+                "bounce_rate", "engagement_rate", "avg_engagement_s",
+            ]].rename(columns={
+                "page_path": "Page", "page_category": "Category",
+                "sessions": "Sessions", "bounce_rate": "Bounce Rate",
+                "engagement_rate": "Eng. Rate", "avg_engagement_s": "Avg Time",
+            }).copy()
+            display_drop["Bounce Rate"] = display_drop["Bounce Rate"].map(_pct)
+            display_drop["Eng. Rate"] = display_drop["Eng. Rate"].map(_pct)
+            display_drop["Avg Time"] = display_drop["Avg Time"].apply(_fmt_duration)
+            st.dataframe(display_drop, use_container_width=True, hide_index=True)
+
+            drop_key = f"dropoff_analysis_{curr_start}_{curr_end}"
+            if st.button("Analyse Dropoffs", key=f"btn_{drop_key}", type="primary"):
+                drop_text = _page_table_text(dropoff_pages.head(20))
+                conv_ref_text = _page_table_text(top_conv_for_ref) if not top_conv_for_ref.empty else "(no conversion data)"
+                with st.spinner("Analysing..."):
+                    result = analyse_dropoff_pages(
+                        date_range=date_label,
+                        dropoff_pages_text=drop_text,
+                        converting_pages_text=conv_ref_text,
+                    )
+                    st.session_state[drop_key] = result
+
+            if drop_key in st.session_state and st.session_state[drop_key]:
+                st.info(st.session_state[drop_key])
+
     # =========================================================================
     # TAB 2: Channel Quality
     # =========================================================================
@@ -573,207 +606,4 @@ def render():
             display_lp["Avg Time"] = display_lp["Avg Time"].apply(_fmt_duration)
             st.dataframe(display_lp, use_container_width=True, hide_index=True)
 
-    # =========================================================================
-    # TAB 4: Conversions & Dropoffs
-    # =========================================================================
-    with tabs[3]:
 
-        # --- Conversions section ---
-        st.subheader("Conversions")
-
-        conv_data_available = df_f["conversions"].sum() > 0
-        events_available = df_ev is not None
-
-        if not conv_data_available and not events_available:
-            st.info("No conversion data yet — re-fetch GA4 data to populate.")
-        else:
-            if events_available:
-                mask_ev = (df_ev["date"].dt.date >= curr_start) & (df_ev["date"].dt.date <= curr_end)
-                ev_f = df_ev[mask_ev][df_ev[mask_ev]["event_name"].isin(CONVERSION_EVENTS)]
-
-                if not ev_f.empty:
-                    # KPI: total per event
-                    totals = ev_f.groupby("event_name")["event_count"].sum().reset_index()
-                    totals["event_name"] = totals["event_name"].str.replace("bifrost_", "").str.replace("_", " ")
-                    cols = st.columns(len(totals))
-                    for i, (_, row) in enumerate(totals.iterrows()):
-                        cols[i].metric(row["event_name"].title(), int(row["event_count"]))
-
-                    # Bar: conversions by channel group
-                    channel_totals = (
-                        ev_f.groupby("session_primary_channel_group")["event_count"].sum()
-                        .reset_index()
-                        .sort_values("event_count", ascending=True)
-                    )
-                    fig_ch = px.bar(
-                        channel_totals, x="event_count", y="session_primary_channel_group", orientation="h",
-                        labels={"event_count": "Conversions", "session_primary_channel_group": "Channel"},
-                        title="Conversions by Channel Group",
-                    )
-                    st.plotly_chart(fig_ch, use_container_width=True)
-
-                    # Line: weekly conversion trend
-                    ev_f2 = ev_f.copy()
-                    ev_f2["week"] = ev_f2["date"].dt.to_period("W-SAT").apply(lambda r: r.start_time)
-                    weekly_conv = (
-                        ev_f2.groupby(["week", "event_name"])["event_count"].sum().reset_index()
-                    )
-                    weekly_conv["event_name"] = weekly_conv["event_name"].str.replace("bifrost_", "")
-                    fig_trend = px.line(
-                        weekly_conv, x="week", y="event_count", color="event_name",
-                        labels={"week": "Week", "event_count": "Conversions", "event_name": "Event"},
-                        title="Weekly Conversion Trend by Event",
-                        markers=True,
-                    )
-                    st.plotly_chart(fig_trend, use_container_width=True)
-
-            # Top converting pages (from ga4 conversions column)
-            if conv_data_available:
-                top_conv_pages = (
-                    df_f.groupby("page_path")
-                    .agg(sessions=("sessions", "sum"), conversions=("conversions", "sum"))
-                    .reset_index()
-                )
-                top_conv_pages = top_conv_pages[top_conv_pages["conversions"] > 0]
-                top_conv_pages["conv_rate"] = top_conv_pages["conversions"] / top_conv_pages["sessions"]
-                top_conv_pages = top_conv_pages.sort_values("conversions", ascending=False).head(20)
-
-                fig_cp = px.bar(
-                    top_conv_pages.sort_values("conversions", ascending=True),
-                    x="conversions", y="page_path", orientation="h",
-                    labels={"conversions": "Conversions", "page_path": "Page"},
-                    title="Top Converting Pages (sessions where a conversion also occurred)",
-                )
-                st.plotly_chart(fig_cp, use_container_width=True)
-
-        st.divider()
-
-        # --- Dropoff pages section ---
-        st.subheader("Top Dropoff Pages")
-        st.caption(
-            "High-traffic pages with high bounce rate (low engagement) and zero conversions. "
-            "Pages that appear in converting sessions are excluded — these are pure dead ends."
-        )
-
-        page_bounce = (
-            df_f.groupby("page_path")
-            .agg(
-                sessions=("sessions", "sum"),
-                engaged_sessions=("engaged_sessions", "sum"),
-                engagement_duration_s=("engagement_duration_s", "sum"),
-                conversions=("conversions", "sum"),
-            )
-            .reset_index()
-        )
-        page_bounce = _derive_metrics(page_bounce[page_bounce["sessions"] >= 20])
-        page_bounce["page_category"] = page_bounce["page_path"].apply(categorize_page)
-
-        converting_pages = set(page_bounce[page_bounce["conversions"] > 0]["page_path"].tolist())
-        dropoff_pages = page_bounce[
-            (~page_bounce["page_path"].isin(converting_pages)) &
-            (page_bounce["bounce_rate"] >= 0.5)
-        ].sort_values("sessions", ascending=False).head(30)
-
-        top_conv_for_ref = page_bounce[
-            page_bounce["page_path"].isin(converting_pages)
-        ].sort_values("conversions", ascending=False).head(10)
-
-        if dropoff_pages.empty:
-            st.info("No dropoff pages found for the selected period.")
-        else:
-            fig_drop = px.bar(
-                dropoff_pages.head(20).sort_values("sessions", ascending=True),
-                x="sessions", y="page_path", orientation="h",
-                labels={"sessions": "Sessions", "page_path": "Page"},
-                title="Top 20 Dropoff Pages — high traffic, high bounce, zero conversions",
-            )
-            st.plotly_chart(fig_drop, use_container_width=True)
-
-            display_drop = dropoff_pages[[
-                "page_path", "page_category", "sessions",
-                "bounce_rate", "engagement_rate", "avg_engagement_s",
-            ]].rename(columns={
-                "page_path": "Page", "page_category": "Category",
-                "sessions": "Sessions", "bounce_rate": "Bounce Rate",
-                "engagement_rate": "Eng. Rate", "avg_engagement_s": "Avg Time",
-            }).copy()
-            display_drop["Bounce Rate"] = display_drop["Bounce Rate"].map(_pct)
-            display_drop["Eng. Rate"] = display_drop["Eng. Rate"].map(_pct)
-            display_drop["Avg Time"] = display_drop["Avg Time"].apply(_fmt_duration)
-            st.dataframe(display_drop, use_container_width=True, hide_index=True)
-
-            # Analyse button
-            drop_key = f"dropoff_analysis_{curr_start}_{curr_end}"
-            if st.button("Analyse Dropoffs", key=f"btn_{drop_key}", type="primary"):
-                drop_text = _page_table_text(dropoff_pages.head(20))
-                conv_ref_text = _page_table_text(top_conv_for_ref) if not top_conv_for_ref.empty else "(no conversion data)"
-                with st.spinner("Analysing..."):
-                    result = analyse_dropoff_pages(
-                        date_range=date_label,
-                        dropoff_pages_text=drop_text,
-                        converting_pages_text=conv_ref_text,
-                    )
-                    st.session_state[drop_key] = result
-
-            if drop_key in st.session_state and st.session_state[drop_key]:
-                st.info(st.session_state[drop_key])
-
-    # =========================================================================
-    # TAB 5: Scroll Depth
-    # =========================================================================
-    with tabs[4]:
-        st.subheader("Scroll Depth (90% completion rate)")
-        st.caption(
-            "GA4 enhanced measurement fires a scroll event at 90% page depth. "
-            "Pages with fewer than 50 views in the period are excluded."
-        )
-
-        if df_pe is None:
-            st.info("No page event data yet. Fetch GA4 data to populate.")
-        else:
-            mask_pe = (df_pe["date"].dt.date >= curr_start) & (df_pe["date"].dt.date <= curr_end)
-            df_pe_f = df_pe[mask_pe]
-
-            pivot = (
-                df_pe_f.groupby(["page_path", "page_category", "event_name"], observed=True)["event_count"]
-                .sum()
-                .unstack(fill_value=0)
-                .reset_index()
-            )
-
-            if "page_view" not in pivot.columns or "scroll" not in pivot.columns:
-                st.info("Scroll or page_view events not found in the selected date range.")
-            else:
-                pivot = pivot[pivot["page_view"] >= 50].copy()
-                pivot["completion_rate"] = pivot["scroll"] / pivot["page_view"]
-
-                by_cat = (
-                    pivot.groupby("page_category", observed=True)
-                    .agg(page_views=("page_view", "sum"), scrolls=("scroll", "sum"))
-                    .reset_index()
-                )
-                by_cat = by_cat[by_cat["page_views"] > 0].copy()
-                by_cat["completion_rate"] = by_cat["scrolls"] / by_cat["page_views"]
-                by_cat = by_cat.sort_values("completion_rate", ascending=True)
-
-                fig = px.bar(
-                    by_cat, x="completion_rate", y="page_category", orientation="h",
-                    labels={"completion_rate": "Scroll Completion Rate", "page_category": "Category"},
-                    title="Scroll Completion Rate by Category (90% threshold)",
-                )
-                fig.update_xaxes(tickformat=".0%")
-                st.plotly_chart(fig, use_container_width=True)
-
-                top_pages = (
-                    pivot[["page_path", "page_category", "page_view", "scroll", "completion_rate"]]
-                    .sort_values("completion_rate", ascending=False)
-                    .head(25)
-                    .rename(columns={
-                        "page_path": "Page", "page_category": "Category",
-                        "page_view": "Page Views", "scroll": "Scroll Events",
-                        "completion_rate": "Completion Rate",
-                    })
-                    .copy()
-                )
-                top_pages["Completion Rate"] = top_pages["Completion Rate"].map(_pct)
-                st.dataframe(top_pages, use_container_width=True, hide_index=True)

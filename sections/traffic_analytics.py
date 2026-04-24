@@ -252,21 +252,14 @@ def render():
         df_src_latest = df_latest
         df_src_prev = df_prev
 
-    # Filter source-level frames to sources that drove non-/jobs traffic.
-    # ga4 (page-level) already excludes /jobs pages, so its source set is the
-    # authoritative list. Sources that only drove /jobs traffic are dropped from
-    # breakdowns but NOT from the session total (which stays accurate vs GA4 UI).
-    non_jobs_sources = set(df_latest["session_source"].astype(str).unique())
-    df_src_display = df_src_latest[df_src_latest["session_source"].astype(str).isin(non_jobs_sources)]
-    df_src_prev_display = (
-        df_src_prev[df_src_prev["session_source"].astype(str).isin(non_jobs_sources)]
-        if df_src_prev is not None else None
-    )
+    df_src_display = df_src_latest
+    df_src_prev_display = df_src_prev
 
     period_range_label = f"{curr_start.strftime('%b %d')} – {curr_end.strftime('%b %d, %Y')}"
 
     # --- Overview (latest period with delta) ---
     st.subheader(f"Period Summary ({period_range_label})")
+    st.caption("Total GA4 sessions and distinct traffic sources for the selected period vs the previous same-length window.")
     latest_sessions = df_src_latest["sessions"].sum()  # unfiltered — matches GA4 UI
 
     session_delta = None
@@ -281,6 +274,7 @@ def render():
 
     # --- Traffic by Medium ---
     st.subheader(f"Traffic by Medium ({period_range_label})")
+    st.caption("Sessions grouped by channel type (organic, direct, referral, paid, etc.) — shows which acquisition mediums are growing or shrinking vs the prior period.")
 
     medium_col = "session_medium"
     if medium_col in df_src_display.columns:
@@ -316,6 +310,7 @@ def render():
 
     # --- Sessions by source (latest period with change) ---
     st.subheader(f"Sessions by Source ({period_range_label})")
+    st.caption("Top 30 individual traffic sources ranked by session volume, with period-over-period change. Matches GA4's Traffic Acquisition report numbers.")
 
     source_latest = (
         df_src_display.groupby("session_source", observed=True)["sessions"]
@@ -348,7 +343,8 @@ def render():
     )
 
     # --- Source trend over time ---
-    st.subheader("Source Trend")
+    st.subheader("Sessions Over Time — Top Sources")
+    st.caption("Session volume for the top 8 sources plotted over time — shows which sources are trending up, down, or plateauing across the selected window.")
 
     granularity = st.radio(
         "Trend granularity",
@@ -513,7 +509,8 @@ def render():
         st.info("Re-fetch data to populate page category session counts.")
 
     # --- Per-source landing page drill-down ---
-    st.subheader("Landing Page Breakdown by Source")
+    st.subheader("Entry Sessions by Page Category — Source Drill-down")
+    st.caption("Select a source to see which sections of the site its users first arrive at — entry sessions per page category, not total sessions.")
 
     available_sources = source_latest["session_source"].tolist()
     drill_source = st.selectbox(
@@ -596,6 +593,7 @@ def render():
 
     # --- Inverted drill-down: source breakdown by page category ---
     st.subheader("Source Breakdown by Page Category")
+    st.caption("The inverse drill-down: select a content section to see which sources its visitors come from — useful for understanding each page category's acquisition mix.")
 
     # Use ga4_category_sessions (GA4-accurate) when available, fall back to landing pages
     if df_cat is not None:
@@ -643,6 +641,7 @@ def render():
 
     # --- GEO Traffic (AI sources) ---
     st.subheader(f"GEO Traffic — AI Sources ({period_range_label})")
+    st.caption("Sessions originating from AI platforms (ChatGPT, Claude, Perplexity, Gemini) — a direct signal of how often AI assistants are driving users to our site.")
 
     geo_latest = df_src_latest[df_src_latest["source_normalized"].isin(GEO_SOURCES)]
     geo_prev = (
@@ -810,6 +809,7 @@ def render():
         )
 
         st.subheader(f"Users & Sessions by Medium ({period_range_label})")
+        st.caption("Sessions and unique users rolled up by medium — parallels the source table above but at channel-type granularity (organic, direct, referral, etc.).")
 
         def _users_by_medium(df_weekly):
             if df_weekly is None:
@@ -857,6 +857,8 @@ def render():
         )
 
         # Users trend — weekly user acquisition data; top 8 first-user sources.
+        st.subheader(f"User Acquisition Trend — Top Sources ({period_range_label})")
+        st.caption("Total users over time for the top 8 first-user sources — sourced from GA4's User Acquisition report. Log scale available to make smaller sources visible alongside Google.")
         top_users = by_src.head(8)["source"].tolist()
         trend_base = tw_latest.rename(columns={"first_user_source": "session_source"}) if tw_latest is not None else t_latest
         t_latest_b = _bucket(trend_base, granularity)
@@ -967,3 +969,19 @@ def render():
                 hide_index=True,
                 width="stretch",
             )
+
+            # Weekly conversion trend
+            e_all = _slice(events, prev_start, curr_end)
+            e_all = e_all.copy()
+            e_all["week"] = e_all["date"].dt.to_period("W-SAT").apply(lambda r: r.start_time)
+            weekly_conv = (
+                e_all.groupby(["week", "event_name"])["event_count"].sum().reset_index()
+            )
+            weekly_conv["event_name"] = weekly_conv["event_name"].str.replace("bifrost_", "").str.replace("_", " ")
+            fig_conv_trend = px.line(
+                weekly_conv, x="week", y="event_count", color="event_name",
+                markers=True,
+                title="Weekly Conversion Trend",
+                labels={"week": "Week", "event_count": "Conversions", "event_name": "Event"},
+            )
+            st.plotly_chart(fig_conv_trend, width="stretch")

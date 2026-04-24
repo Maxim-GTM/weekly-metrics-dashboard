@@ -54,9 +54,10 @@ if stale:
 # --- Section navigation ---
 SECTIONS = {
     "Search Impressions (GSC)": "search_impressions",
+    "GSC Coverage (Index Status)": "gsc_coverage",
     "Traffic Analytics (GA4)": "traffic_analytics",
     "Content Analytics (GA4)": "content_analytics",
-    "Growth Diagnostics": "diagnostics",
+    # "Growth Diagnostics": "diagnostics",  # hidden until ready
     "Keyword Performance": "keyword_performance",
     "GEO Performance (Profound)": "geo_profound",
 }
@@ -65,12 +66,14 @@ selected = st.sidebar.radio("Section", list(SECTIONS.keys()))
 
 if selected == "Search Impressions (GSC)":
     from sections.search_impressions import render
+elif selected == "GSC Coverage (Index Status)":
+    from sections.gsc_coverage import render
 elif selected == "Traffic Analytics (GA4)":
     from sections.traffic_analytics import render
 elif selected == "Content Analytics (GA4)":
     from sections.content_analytics import render
-elif selected == "Growth Diagnostics":
-    from sections.diagnostics import render
+# elif selected == "Growth Diagnostics":
+#     from sections.diagnostics import render
 elif selected == "Keyword Performance":
     from sections.keyword_performance import render
 elif selected == "GEO Performance (Profound)":

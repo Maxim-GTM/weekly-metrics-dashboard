@@ -73,6 +73,7 @@ def _load_all_gsc_data() -> pd.DataFrame | None:
     return _enrich_gsc_df(df)
 
 
+
 def render():
     st.header("Search Impressions (GSC)")
 
@@ -163,6 +164,7 @@ def render():
 
     period_range_label = f"{curr_start.strftime('%b %d')} – {curr_end.strftime('%b %d, %Y')}"
     st.subheader(f"Period Summary ({period_range_label})")
+    st.caption("Total impressions, clicks, CTR, and unique pages Google served our site for in search results during this period, compared to the previous same-length window.")
 
     # Headline metrics from site-level totals (matches GSC UI)
     if site_df is not None:
@@ -191,7 +193,7 @@ def render():
             imp_delta = f"{(latest_impressions - prev_impressions) / prev_impressions * 100:+.0f}%"
         if prev_clicks:
             click_delta = f"{(latest_clicks - prev_clicks) / prev_clicks * 100:+.0f}%"
-        ctr_delta = f"{latest_ctr - prev_ctr:+.1f}pp"
+        ctr_delta = f"{latest_ctr - prev_ctr:+.1f} pts"
 
     # Pages in search from page-level data (site_daily has no page column)
     pages_in_search = 0
@@ -213,13 +215,14 @@ def render():
     m1.metric("Impressions", f"{latest_impressions:,.0f}", delta=imp_delta)
     m2.metric("Clicks", f"{latest_clicks:,.0f}", delta=click_delta)
     m3.metric("CTR", f"{latest_ctr:.1f}%", delta=ctr_delta)
-    m4.metric("Pages in Search", f"{pages_in_search:,}", delta=pages_delta)
+    m4.metric("Pages Receiving Impressions", f"{pages_in_search:,}", delta=pages_delta)
 
     if df_latest.empty:
         return
 
     # --- Impressions over time ---
     st.subheader("Impressions Trend")
+    st.caption("How total search impressions have moved across the selected window — choose a granularity to smooth daily noise or zoom into specific spikes.")
 
     granularity = st.radio(
         "Trend granularity",
@@ -252,6 +255,7 @@ def render():
 
     # --- Page category breakdown (latest period with change vs previous) ---
     st.subheader(f"Impressions by Page Category ({period_range_label})")
+    st.caption("Search impressions and clicks for each section of the site, with each category's share of total impressions and its change vs the prior period.")
 
     cat_latest = (
         df_latest.groupby("page_category")
@@ -297,7 +301,8 @@ def render():
     )
 
     # --- Page category trend over time ---
-    st.subheader("Page Category Trend")
+    st.subheader("Impressions by Page Category Over Time")
+    st.caption("How impressions for each content section have shifted across the period — use this to spot which areas are gaining or losing search visibility relative to each other.")
 
     cat_trend = (
         df_latest_b.groupby(["bucket", "bucket_label", "page_category"], observed=True)["impressions"]
@@ -320,6 +325,7 @@ def render():
 
     # --- Top 10 countries ---
     st.subheader(f"Top Countries ({period_range_label})")
+    st.caption("The 10 countries generating the most impressions, with average ranking position and period-over-period impression change — useful for spotting geographic reach shifts.")
 
     country_df = query_df(
         "SELECT date, country, clicks, impressions, ctr, position "
@@ -375,7 +381,7 @@ def render():
             "impressions": "Impressions",
             "clicks": "Clicks",
             "ctr": "CTR %",
-            "position": "Avg Position",
+            "position": "Avg Position (1=top)",
         }
         if "imp_change" in country_stats.columns:
             display_cols["imp_change"] = "Change"
@@ -384,3 +390,4 @@ def render():
             hide_index=True,
             width="stretch",
         )
+

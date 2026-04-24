@@ -281,6 +281,83 @@ def upsert_ga4_page_events(rows: list[dict]):
     )
 
 
+def upsert_ga4_page_before_conversion(rows: list[dict]):
+    """Upsert previous-page-path counts for conversion events."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO ga4_page_before_conversion (date, previous_page_path, event_name, event_count)
+        VALUES (%(date)s, %(previous_page_path)s, %(event_name)s, %(event_count)s)
+        ON CONFLICT (date, previous_page_path, event_name) DO UPDATE SET
+            event_count = EXCLUDED.event_count
+        """,
+        rows,
+    )
+
+
+def upsert_gsc_coverage_daily(rows: list[dict]):
+    """Upsert daily indexed/not-indexed counts from GSC Coverage Chart.csv."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO gsc_coverage_daily (date, indexed, not_indexed, impressions)
+        VALUES (%(date)s, %(indexed)s, %(not_indexed)s, %(impressions)s)
+        ON CONFLICT (date) DO UPDATE SET
+            indexed     = EXCLUDED.indexed,
+            not_indexed = EXCLUDED.not_indexed,
+            impressions = EXCLUDED.impressions
+        """,
+        rows,
+    )
+
+
+def upsert_gsc_coverage_reasons(rows: list[dict]):
+    """Upsert not-indexed reason snapshot from GSC Coverage issues CSVs."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO gsc_coverage_reasons (as_of_date, reason, source, validation, pages)
+        VALUES (%(as_of_date)s, %(reason)s, %(source)s, %(validation)s, %(pages)s)
+        ON CONFLICT (as_of_date, reason) DO UPDATE SET
+            source     = EXCLUDED.source,
+            validation = EXCLUDED.validation,
+            pages      = EXCLUDED.pages
+        """,
+        rows,
+    )
+
+
+def upsert_gsc_coverage_urls(rows: list[dict]):
+    """Upsert individual URLs from a GSC Coverage Drilldown Table.csv."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO gsc_coverage_urls (as_of_date, reason, url, last_crawled)
+        VALUES (%(as_of_date)s, %(reason)s, %(url)s, %(last_crawled)s)
+        ON CONFLICT (as_of_date, reason, md5(url)) DO NOTHING
+        """,
+        rows,
+    )
+
+
+def upsert_gsc_non_indexed(rows: list[dict]):
+    """Upsert non-indexed page snapshots (week_start × page_url)."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO gsc_non_indexed (week_start, page_url)
+        VALUES (%(week_start)s, %(page_url)s)
+        ON CONFLICT (week_start, md5(page_url)) DO NOTHING
+        """,
+        rows,
+    )
+
+
 def upsert_keywords(rows: list[dict]):
     """Upsert keyword ranking rows."""
     if not rows:

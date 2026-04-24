@@ -15,21 +15,6 @@ from google.analytics.data_v1beta.types import (
     RunReportRequest,
 )
 
-def _not_jobs_filter(field: str = "pagePath") -> FilterExpression:
-    """Exclude sessions where the given field contains /jobs."""
-    return FilterExpression(
-        not_expression=FilterExpression(
-            filter=Filter(
-                field_name=field,
-                string_filter=Filter.StringFilter(
-                    match_type=Filter.StringFilter.MatchType.CONTAINS,
-                    value="/jobs",
-                    case_sensitive=False,
-                ),
-            )
-        )
-    )
-
 
 # Per-category GA4 filter specs: list of (field, match_type, value).
 # Multiple conditions within a category are OR-combined.
@@ -75,6 +60,19 @@ def _build_category_filter(conditions: list[tuple[str, str, str]]) -> FilterExpr
     ]
     return exprs[0] if len(exprs) == 1 else FilterExpression(
         or_group=FilterExpressionList(expressions=exprs)
+    )
+
+
+def _not_jobs_filter(field: str = "pagePath") -> FilterExpression:
+    """Exclude /jobs pages from GA4 fetches."""
+    return FilterExpression(
+        not_expression=FilterExpression(filter=Filter(
+            field_name=field,
+            string_filter=Filter.StringFilter(
+                match_type=Filter.StringFilter.MatchType.BEGINS_WITH,
+                value="/jobs",
+            ),
+        ))
     )
 
 
@@ -226,7 +224,84 @@ def fetch_gsc_data(start_date: str, end_date: str) -> int:
 
     upsert_gsc(all_rows)
     sync_gsc_keyword_rankings()
+    _fetch_non_indexed_pages(start_date, end_date)
     return len(all_rows)
+
+
+SITEMAP_URL = "https://www.getmaxim.ai/sitemap.xml"
+
+
+def _parse_sitemap(url: str) -> list[str]:
+    """Recursively fetch and parse a sitemap or sitemap index; return all page URLs."""
+    import urllib.request
+    import xml.etree.ElementTree as ET
+
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; metrics-dashboard/1.0)"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        root = ET.fromstring(resp.read())
+
+    ns = (root.tag.split("}")[0] + "}") if "}" in root.tag else ""
+    tag = root.tag.split("}")[-1] if "}" in root.tag else root.tag
+    urls = []
+    if tag == "sitemapindex":
+        for sm in root.findall(f"{ns}sitemap"):
+            loc = sm.find(f"{ns}loc")
+            if loc is not None and loc.text:
+                urls.extend(_parse_sitemap(loc.text.strip()))
+    else:
+        for url_el in root.findall(f"{ns}url"):
+            loc = url_el.find(f"{ns}loc")
+            if loc is not None and loc.text:
+                urls.append(loc.text.strip().rstrip("/").lower())
+    return urls
+
+
+def _fetch_non_indexed_pages(start_date: str, end_date: str):
+    """Diff sitemap URLs against GSC-seen pages per week; upsert to gsc_non_indexed.
+
+    Called at the end of fetch_gsc_data (after gsc_page_daily is populated).
+    Runs per-week within the range so the table stores a weekly trend.
+    Silently skips if the sitemap is unreachable.
+    """
+    from datetime import date as _date, timedelta
+    from db import get_pool, query_df, upsert_gsc_non_indexed
+
+    try:
+        sitemap_urls = set(_parse_sitemap(SITEMAP_URL))
+    except Exception:
+        return
+
+    start = _date.fromisoformat(start_date)
+    end = _date.fromisoformat(end_date)
+
+    # Delete stale rows for this range before re-computing
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM gsc_non_indexed WHERE week_start >= %s AND week_start <= %s",
+                (start_date, end_date),
+            )
+        conn.commit()
+
+    all_rows = []
+    wk = start
+    while wk <= end:
+        wk_end = min(wk + timedelta(days=6), end)
+        gsc_df = query_df(
+            "SELECT DISTINCT LOWER(RTRIM(page, '/')) AS page "
+            "FROM gsc_page_daily WHERE date >= %s AND date <= %s",
+            (wk.isoformat(), wk_end.isoformat()),
+        )
+        gsc_pages = set(gsc_df["page"].tolist()) if not gsc_df.empty else set()
+        for url in sitemap_urls - gsc_pages:
+            all_rows.append({"week_start": wk.isoformat(), "page_url": url})
+        wk += timedelta(days=7)
+
+    upsert_gsc_non_indexed(all_rows)
 
 
 def _fetch_gsc_dimensioned(service, site_url, start_date, end_date, dimensions, mapper):
@@ -273,13 +348,10 @@ def fetch_ga4_data(start_date: str, end_date: str) -> int:
         upsert_ga4_traffic,
         upsert_ga4_events,
         upsert_ga4_landing_pages,
-        upsert_ga4_page_events,
     )
 
     credentials = _get_credentials(GA4_SCOPES)
     client = BetaAnalyticsDataClient(credentials=credentials)
-
-    not_jobs = _not_jobs_filter("pagePath")
 
     # --- Source+medium-level traffic (daily) — accurate sessions, inflated user counts ---
     traffic_rows = _fetch_ga4_report(
@@ -287,6 +359,7 @@ def fetch_ga4_data(start_date: str, end_date: str) -> int:
         dimensions=["date", "sessionSource", "sessionMedium"],
         metrics=["sessions", "totalUsers", "activeUsers",
                  "engagedSessions", "newUsers", "userEngagementDuration"],
+        dimension_filter=_not_jobs_filter("pagePath"),
         mapper=lambda dims, metrics: {
             "date": _ga4_date(dims[0]),
             "session_source": dims[1],
@@ -318,7 +391,7 @@ def fetch_ga4_data(start_date: str, end_date: str) -> int:
                     for name in TRACKED_EVENT_NAMES
                 ])
             ),
-            not_jobs,
+            _not_jobs_filter("pagePath"),
         ])
     )
     event_rows = _fetch_ga4_report(
@@ -342,7 +415,7 @@ def fetch_ga4_data(start_date: str, end_date: str) -> int:
         dimensions=["date", "pagePath", "sessionSource", "sessionMedium"],
         metrics=["sessions", "engagedSessions", "userEngagementDuration", "newUsers",
                  "conversions"],
-        dimension_filter=not_jobs,
+        dimension_filter=_not_jobs_filter("pagePath"),
         mapper=lambda dims, metrics: {
             "date": _ga4_date(dims[0]),
             "page_path": dims[1],
@@ -371,7 +444,7 @@ def fetch_ga4_data(start_date: str, end_date: str) -> int:
         dimensions=["date", "landingPage", "sessionSource", "sessionMedium"],
         metrics=["sessions", "engagedSessions", "newUsers", "userEngagementDuration",
                  "conversions"],
-        dimension_filter=None,
+        dimension_filter=_not_jobs_filter("landingPage"),
         mapper=lambda dims, metrics: {
             "date": _ga4_date(dims[0]),
             "landing_page": dims[1],
@@ -387,38 +460,6 @@ def fetch_ga4_data(start_date: str, end_date: str) -> int:
     if landing_rows:
         upsert_ga4_landing_pages(landing_rows)
 
-    # --- Page-level events: page_view + scroll (for scroll depth analysis) ---
-    page_event_filter = FilterExpression(
-        and_group=FilterExpressionList(expressions=[
-            FilterExpression(
-                or_group=FilterExpressionList(expressions=[
-                    FilterExpression(filter=Filter(
-                        field_name="eventName",
-                        string_filter=Filter.StringFilter(value="scroll"),
-                    )),
-                    FilterExpression(filter=Filter(
-                        field_name="eventName",
-                        string_filter=Filter.StringFilter(value="page_view"),
-                    )),
-                ])
-            ),
-            not_jobs,
-        ])
-    )
-    page_event_rows = _fetch_ga4_report(
-        client, property_id, start_date, end_date,
-        dimensions=["date", "pagePath", "eventName"],
-        metrics=["eventCount"],
-        dimension_filter=page_event_filter,
-        mapper=lambda dims, metrics: {
-            "date": _ga4_date(dims[0]),
-            "page_path": dims[1],
-            "event_name": dims[2],
-            "event_count": int(metrics[0]),
-        },
-    )
-    if page_event_rows:
-        upsert_ga4_page_events(page_event_rows)
 
     # --- Per-category session counts (one filtered query per category) ---
     fetch_ga4_category_sessions(start_date, end_date, client=client, property_id=property_id)
@@ -452,6 +493,7 @@ def _fetch_ga4_traffic_weekly(client, property_id: str, start_date: str, end_dat
             week_start.isoformat(), week_end.isoformat(),
             dimensions=["firstUserSource", "firstUserMedium"],
             metrics=["totalUsers", "newUsers"],
+            dimension_filter=_not_jobs_filter("pagePath"),
             mapper=lambda dims, metrics, d=week_start: {
                 "date": d.isoformat(),
                 "first_user_source": dims[0],

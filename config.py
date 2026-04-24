@@ -67,10 +67,22 @@ def categorize_page(page_path: str) -> str:
         if page_path.rstrip("/") == pattern.rstrip("/"):
             return name
 
-    # Check path prefixes
+    # Check explicit prefix matches
     for prefix, name in PAGE_CATEGORIES.items():
         if page_path.startswith(prefix):
             return name
+
+    # Auto-group /bifrost/<segment>/... by the segment name.
+    # e.g. /bifrost/resources/mcp-gateway → "Bifrost Resources"
+    #      /bifrost/provider-status/azure → "Bifrost Provider Status"
+    parts = [p for p in page_path.split("/") if p]
+    if len(parts) >= 2 and parts[0] == "bifrost":
+        segment = parts[1].replace("-", " ").title()
+        return f"Bifrost {segment}"
+
+    # /enterprise/<slug> paths are docs.getbifrost.ai enterprise docs pages
+    if len(parts) >= 2 and parts[0] == "enterprise":
+        return "Bifrost Docs"
 
     return "Other"
 

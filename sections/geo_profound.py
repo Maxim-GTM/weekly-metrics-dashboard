@@ -177,7 +177,15 @@ def render():
     df["comp_mentioned"] = df["mentions"].apply(_comp_mentioned)
 
     # --- Filters ---
-    col1, col2, col3 = st.columns(3)
+    _platform_opts = ["All"] + PLATFORMS
+    selected_platform = st.sidebar.selectbox(
+        "Platform",
+        _platform_opts,
+        index=_platform_opts.index(st.session_state.get("geo_platform", "All")),
+        key="geo_platform",
+    )
+
+    col1, col2 = st.columns(2)
     with col1:
         topics = sorted(df["topic"].unique())
         selected_topic = st.selectbox("Topic", ["All"] + topics)
@@ -189,8 +197,6 @@ def render():
             min_value=min(dates),
             max_value=max(dates),
         )
-    with col3:
-        selected_platform = st.selectbox("Platform", ["All"] + PLATFORMS)
 
     # Apply filters
     mask = pd.Series(True, index=df.index)
@@ -210,6 +216,7 @@ def render():
 
     # --- Overview metrics ---
     st.subheader("Overview")
+    st.caption("High-level GEO visibility: how many prompts we tracked, how many we appeared in at least once across any platform, and how many of our pages were cited in responses.")
 
     total_prompts = filtered["prompt"].nunique()
     mentioned = filtered[filtered["is_mentioned"]]
@@ -224,9 +231,9 @@ def render():
     m1, m2, m3 = st.columns(3)
     m1.metric("Unique Prompts", total_prompts)
     m2.metric(
-        "Prompt Reach",
+        "Prompts We Appeared In",
         f"{prompts_appeared}/{total_prompts}",
-        help="Unique prompts mentioned in at least one row across any platform and day in the date range.",
+        help="Prompts where our brand was mentioned at least once, across any platform within the date range.",
     )
     m3.metric("Our Articles Cited", unique_articles_cited)
 
@@ -275,7 +282,9 @@ def render():
         st.dataframe(pd.DataFrame(per_platform_rows), hide_index=True, width="stretch")
         st.caption(
             "Mean = average per-prompt mention rate on that platform. "
-            "Threshold columns = # prompts whose per-prompt mention rate meets that floor."
+            "Threshold columns = prompts whose mention rate meets that floor. "
+            "**These nest — ≥50% is a subset of ≥25%, not additional prompts.** "
+            "E.g. if ≥25% = 8 and ≥50% = 6, that means 6 of the same 8 prompts also clear 50%."
         )
 
         thr_df = pd.DataFrame(threshold_rows)
@@ -292,22 +301,110 @@ def render():
         fig_thr.update_traces(textposition="outside")
         st.plotly_chart(fig_thr, width="stretch")
 
+        # --- Rank buckets ---
+        def _rank_bucket(pos_str: str) -> str | None:
+            s = str(pos_str).strip().lstrip("#")
+            try:
+                n = int(s)
+                if n == 1:
+                    return "Rank 1"
+                if n == 2:
+                    return "Rank 2"
+                if n == 3:
+                    return "Rank 3"
+                return "Others (4+)"
+            except ValueError:
+                return None
+
+        rank_data = filtered[filtered["is_mentioned"]].copy()
+        rank_data["rank_bucket"] = rank_data["position"].apply(_rank_bucket)
+        rank_data = rank_data[rank_data["rank_bucket"].notna()]
+
+        if not rank_data.empty:
+            st.subheader("Rank Distribution (When Mentioned)")
+            st.caption(
+                "How often our brand appears first, second, third, or lower within an AI response — "
+                "counted across individual response instances (not unique prompts). "
+                "Rank 1 = first entity mentioned in that response."
+            )
+            rank_by_platform = (
+                rank_data.groupby(["platform", "rank_bucket"])
+                .size()
+                .reset_index(name="Responses")
+            )
+            fig_rank = px.bar(
+                rank_by_platform,
+                x="platform",
+                y="Responses",
+                color="rank_bucket",
+                barmode="group",
+                text="Responses",
+                title="Mention rank distribution by platform (response instances)",
+                labels={"platform": "Platform", "rank_bucket": "Rank"},
+                category_orders={
+                    "rank_bucket": ["Rank 1", "Rank 2", "Rank 3", "Others (4+)"]
+                },
+            )
+            fig_rank.update_traces(textposition="outside")
+            st.plotly_chart(fig_rank, width="stretch")
+
+            rank_summary = (
+                rank_data.groupby("rank_bucket")
+                .size()
+                .reindex(["Rank 1", "Rank 2", "Rank 3", "Others (4+)"], fill_value=0)
+                .reset_index(name="Responses")
+            )
+            rank_summary["Share (%)"] = (
+                rank_summary["Responses"] / rank_summary["Responses"].sum() * 100
+            ).round(1)
+            st.dataframe(rank_summary, hide_index=True, width="stretch")
+
+            # --- Per-prompt rank table ---
+            st.markdown("**Rank by Prompt**")
+            st.caption(
+                "How many individual AI response instances placed us at each rank position, per prompt. "
+                "E.g. 'Rank 1 = 3' means we were the first entity named in 3 separate responses for that prompt — not that we consistently rank first overall."
+            )
+            BUCKET_ORDER = ["Rank 1", "Rank 2", "Rank 3", "Others (4+)"]
+            rank_scope = rank_data
+            prompt_rank = (
+                rank_scope.groupby(["prompt", "rank_bucket"])
+                .size()
+                .unstack(fill_value=0)
+                .reindex(columns=BUCKET_ORDER, fill_value=0)
+                .reset_index()
+            )
+            prompt_rank["Total Mentions"] = prompt_rank[BUCKET_ORDER].sum(axis=1)
+            prompt_rank["Best Rank"] = (
+                rank_scope.groupby("prompt")["position"]
+                .apply(lambda s: s.str.lstrip("#").apply(pd.to_numeric, errors="coerce").min())
+                .apply(lambda n: f"#{int(n)}" if pd.notna(n) else "")
+                .values
+            )
+            prompt_rank = prompt_rank.sort_values("Rank 1", ascending=False)
+            st.dataframe(prompt_rank, hide_index=True, width="stretch")
+
     # --- Cross-platform overlap ---
     st.subheader("Cross-Platform Overlap")
+    st.caption("Of the prompts where we were mentioned, how many appeared simultaneously across ChatGPT, AI Overviews, and Perplexity — a measure of breadth vs platform-specific visibility.")
 
     prompt_platforms = (
         mentioned.groupby("prompt")["platform"].apply(set).reset_index()
     )
     prompt_platforms["num_platforms"] = prompt_platforms["platform"].apply(len)
 
-    all_three = (prompt_platforms["num_platforms"] == 3).sum()
-    at_least_two = (prompt_platforms["num_platforms"] >= 2).sum()
-    exactly_one = (prompt_platforms["num_platforms"] == 1).sum()
+    exactly_three = int((prompt_platforms["num_platforms"] == 3).sum())
+    exactly_two = int((prompt_platforms["num_platforms"] == 2).sum())
+    exactly_one = int((prompt_platforms["num_platforms"] == 1).sum())
 
     o1, o2, o3 = st.columns(3)
-    o1.metric("All 3 Platforms", all_three)
-    o2.metric("At Least 2 Platforms", at_least_two)
+    o1.metric("All 3 Platforms", exactly_three)
+    o2.metric("Exactly 2 Platforms", exactly_two)
     o3.metric("Exactly 1 Platform", exactly_one)
+    st.caption(
+        f"These three buckets are mutually exclusive and sum to {exactly_three + exactly_two + exactly_one} prompts where we were mentioned at least once. "
+        "A prompt in 'All 3 Platforms' means our brand appeared on ChatGPT, AI Overviews, and Perplexity for that prompt."
+    )
 
     overlap_data = []
     for p1 in PLATFORMS:
@@ -323,8 +420,10 @@ def render():
     # --- Our Articles Cited ---
     st.subheader("Our Articles Cited")
     st.caption(
-        "Top: pages cited in responses where our brand was mentioned. "
-        "Bottom: pages cited in responses where our brand was not mentioned."
+        "AI responses can reference our content in two ways: by **naming our brand** ('Maxim / Bifrost does X') "
+        "and by **linking to our URLs** (a citation). These don't always happen together — an AI can link to our blog post "
+        "without saying our name, or mention us by name without citing a specific page. "
+        "The two sections below split citations by whether our brand was also named in that same response."
     )
 
     def _owned_pages_df(scope_df: pd.DataFrame) -> pd.DataFrame:
@@ -384,10 +483,10 @@ def render():
     mentioned_pages = _owned_pages_df(filtered[filtered["is_mentioned"]])
     not_mentioned_pages = _owned_pages_df(filtered[~filtered["is_mentioned"]])
 
-    st.markdown("##### Cited + Mentioned")
+    st.markdown("##### Our URL cited AND our brand named in the same response")
     _render_owned_citations(mentioned_pages, "Cited + Mentioned", "cited_mentioned_themes")
 
-    st.markdown("##### Cited but Not Mentioned")
+    st.markdown("##### Our URL cited but our brand NOT named (AI used our content silently)")
     _render_owned_citations(not_mentioned_pages, "Cited but Not Mentioned", "cited_not_mentioned_themes")
 
     # ------------------------------------------------------------------
@@ -414,36 +513,28 @@ def render():
     cite_mention["gap"] = cite_mention["cite_rate"] - cite_mention["mention_rate"]
     cite_mention["abs_gap"] = cite_mention["gap"].abs()
 
-    top_gap = cite_mention[cite_mention["abs_gap"] > 0].sort_values("abs_gap", ascending=False).head(20)
+    top_gap = cite_mention[cite_mention["gap"] > 0].sort_values("gap", ascending=False).head(20)
 
     if not top_gap.empty:
         top_gap = top_gap.sort_values("gap")
         top_gap["label"] = top_gap["prompt"].str[:60]
-        top_gap["direction"] = top_gap["gap"].apply(
-            lambda v: "Cited, not mentioned" if v > 0
-        )
         fig_gap = px.bar(
             top_gap,
             x="gap",
             y="label",
-            color="direction",
             orientation="h",
             title="Top 20 prompts by citation-vs-mention gap (percentage points)",
-            color_discrete_map={
-                "Cited, not mentioned": "#14b8a6",
-            },
+            color_discrete_sequence=["#14b8a6"],
             labels={"gap": "Citation rate − Mention rate (pp)", "label": ""},
         )
         fig_gap.add_vline(x=0, line_color="#888", line_dash="dash")
-        fig_gap.update_layout(
-            legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        )
         st.plotly_chart(fig_gap, width="stretch")
 
     # ------------------------------------------------------------------
     # COMPETITOR MENTIONS — replaces old "Most Cited Pages" section
     # ------------------------------------------------------------------
     st.subheader("Competitor Mentions")
+    st.caption("How often each competitor brand appears in AI responses across tracked prompts, compared to our own mention rate — including a raw frequency count and per-platform breakdown.")
 
     comp_names = _extract_comp_names(filtered["mentions"])
 
@@ -487,6 +578,11 @@ def render():
             st.plotly_chart(fig_rate, width="stretch")
 
         # --- Raw mention frequency chart (original) ---
+        st.caption(
+            "**Raw frequency below** — unlike the chart above (which counts unique prompts), "
+            "this counts every individual AI response instance where a competitor was named. "
+            "A competitor that's tracked on more prompts will naturally have a higher raw count."
+        )
         comp_counts = comp_names.value_counts().reset_index()
         comp_counts.columns = ["Competitor", "Mentions"]
 
@@ -495,7 +591,7 @@ def render():
             x="Mentions",
             y="Competitor",
             orientation="h",
-            title="Most Mentioned Competitors (raw count)",
+            title="Most Mentioned Competitors — raw response count (not % of prompts)",
         )
         fig_comp.update_layout(yaxis={"categoryorder": "total ascending"})
         st.plotly_chart(fig_comp, width="stretch")
@@ -545,6 +641,7 @@ def render():
     # HEAD-TO-HEAD COMPETITOR COMPARISON
     # ------------------------------------------------------------------
     st.subheader("Head-to-Head vs Competitors")
+    st.caption("Per-platform mention rates: us vs configured rivals on the same tracked prompts. Contested prompts are those where a competitor's mention rate meets or exceeds ours.")
 
     # Determine which topic we're looking at for competitor selection
     active_topic = selected_topic if selected_topic != "All" else None
@@ -665,25 +762,51 @@ def render():
             st.success(f"No contested prompts — {topic} leads on all tracked prompts!")
 
     # ------------------------------------------------------------------
-    # MISSED PROMPTS — competitors mentioned, we're not
+    # COMPETITIVE COVERAGE GAPS — competitors mentioned, we're not, in specific rows
     # ------------------------------------------------------------------
-    st.subheader("Missed Prompts")
+    st.subheader("Competitive Coverage Gaps")
     st.caption(
-        "Prompts where competitors are mentioned but we're absent — "
-        "the biggest opportunities for visibility."
+        "Each row below is a prompt where competitors appeared in at least one AI response "
+        "that did not mention us. **A prompt can appear here even if we're mentioned some of "
+        "the time** — check 'Our Rate' to see our overall mention rate for that prompt. "
+        "'Zero-Coverage Platforms' lists platforms where our rate is truly 0% for that prompt."
     )
 
-    # Find prompts where we're NOT mentioned but at least one competitor IS
+    # Find individual response rows where we're NOT mentioned but a competitor IS
     missed = filtered[~filtered["is_mentioned"] & filtered["comp_mentioned"]].copy()
 
     if missed.empty:
-        st.success("No missed prompts — we appear everywhere competitors do!")
+        st.success("No competitive gaps — we appear in every response where competitors do!")
     else:
-        # Group by prompt: show which platforms we're missing on and which competitors appear
+        # Our overall mention rate per prompt (across ALL rows, not just gap rows)
+        prompt_rates = (
+            filtered.groupby("prompt")
+            .agg(
+                total_rows=("is_mentioned", "size"),
+                our_mentioned=("is_mentioned", "sum"),
+            )
+            .reset_index()
+        )
+        prompt_rates["our_rate_pct"] = (
+            prompt_rates["our_mentioned"] / prompt_rates["total_rows"] * 100
+        ).round(0).astype(int)
+
+        # Platforms where our mention rate is truly 0 for each prompt
+        per_prompt_platform = (
+            filtered.groupby(["prompt", "platform"])["is_mentioned"].sum().reset_index()
+        )
+        zero_platforms = (
+            per_prompt_platform[per_prompt_platform["is_mentioned"] == 0]
+            .groupby("prompt")["platform"]
+            .apply(lambda x: ", ".join(sorted(x.unique())))
+            .reset_index()
+            .rename(columns={"platform": "zero_platforms"})
+        )
+
+        # Gap summary: group gap rows by prompt
         missed_summary = (
             missed.groupby("prompt")
             .agg(
-                platforms_missed=("platform", lambda x: ", ".join(sorted(x.unique()))),
                 competitors=("mentions", lambda x: ", ".join(
                     sorted({
                         name for mentions_str in x.dropna()
@@ -691,34 +814,43 @@ def render():
                         if name.strip() in COMPETITOR_NAMES
                     })
                 )),
-                times=("prompt", "size"),
+                gap_instances=("prompt", "size"),
             )
             .reset_index()
-            .sort_values("times", ascending=False)
         )
 
-        # Add topic column
+        # Add topic, our rate, and zero-coverage platforms
         prompt_topics = filtered.groupby("prompt")["topic"].first()
         missed_summary["topic"] = missed_summary["prompt"].map(prompt_topics)
+        missed_summary = missed_summary.merge(
+            prompt_rates[["prompt", "our_rate_pct", "total_rows"]], on="prompt", how="left"
+        )
+        missed_summary = missed_summary.merge(zero_platforms, on="prompt", how="left")
+        missed_summary["zero_platforms"] = missed_summary["zero_platforms"].fillna("—")
+        missed_summary["our_rate"] = missed_summary["our_rate_pct"].astype(str) + "%"
+
+        # Sort by our mention rate ascending (worst coverage first)
+        missed_summary = missed_summary.sort_values("our_rate_pct")
 
         st.dataframe(
-            missed_summary[["topic", "prompt", "platforms_missed", "competitors", "times"]].rename(
-                columns={
-                    "topic": "Topic",
-                    "prompt": "Prompt",
-                    "platforms_missed": "Platforms We're Missing On",
-                    "competitors": "Competitors Mentioned",
-                    "times": "Occurrences",
-                }
-            ),
+            missed_summary[[
+                "topic", "prompt", "our_rate", "zero_platforms", "competitors", "gap_instances"
+            ]].rename(columns={
+                "topic": "Topic",
+                "prompt": "Prompt",
+                "our_rate": "Our Rate",
+                "zero_platforms": "Zero-Coverage Platforms",
+                "competitors": "Competitors Mentioned",
+                "gap_instances": "Gap Instances",
+            }),
             hide_index=True,
             width="stretch",
         )
 
-        # Metric: how many prompts we're missing vs total
+        # Metric: how many prompts have any gap vs total
         n_missed = missed_summary["prompt"].nunique()
         st.metric(
-            "Prompts Where Competitors Appear Without Us",
+            "Prompts With At Least One Competitive Gap",
             f"{n_missed} / {total_prompts}",
         )
 
@@ -787,6 +919,7 @@ Top competitors:\n{comp_summary}
 
     # --- Prompt-level detail table ---
     st.subheader("Prompt Detail")
+    st.caption("Whether our brand was mentioned at least once on each platform for every tracked prompt — use this to identify platforms or individual prompts where we have zero presence.")
 
     prompt_detail = (
         filtered.groupby(["prompt", "platform"])
