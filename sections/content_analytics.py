@@ -214,12 +214,11 @@ def render():
         # Summary table
         tbl = cat[[
             "page_category", "sessions", "engagement_rate", "bounce_rate",
-            "avg_engagement_s", "new_user_rate", "conversions",
+            "avg_engagement_s", "new_user_rate",
         ]].rename(columns={
             "page_category": "Category", "sessions": "Sessions",
             "engagement_rate": "Eng. Rate", "bounce_rate": "Bounce Rate",
             "avg_engagement_s": "Avg Time", "new_user_rate": "New User Rate",
-            "conversions": "Conversions",
         }).copy()
         tbl["Eng. Rate"] = tbl["Eng. Rate"].map(_pct)
         tbl["Bounce Rate"] = tbl["Bounce Rate"].map(_pct)
@@ -289,32 +288,14 @@ def render():
         fig_top.update_layout(margin=dict(l=300, r=20, t=40, b=40))
         st.plotly_chart(fig_top, use_container_width=True)
 
-        # Engagement rate distribution pie
-        if len(page_agg) > 0:
-            buckets = pd.cut(
-                page_agg["engagement_rate"],
-                bins=[0, 0.2, 0.4, 0.6, 0.8, 1.01],
-                labels=["0–20%", "20–40%", "40–60%", "60–80%", "80–100%"],
-                right=False,
-            ).value_counts().reset_index()
-            buckets.columns = ["Engagement Rate Bucket", "Pages"]
-            fig_pie = px.pie(
-                buckets, names="Engagement Rate Bucket", values="Pages",
-                title=f"Engagement Rate Distribution — {selected_cat}",
-            )
-            st.plotly_chart(fig_pie, use_container_width=True)
-
         # Top 20 / Bottom 20 tables
         def _format_page_table(frame: pd.DataFrame) -> pd.DataFrame:
             cols = ["page_path", "sessions", "engagement_rate", "bounce_rate",
                     "avg_engagement_s", "new_user_rate"]
-            if frame["conversions"].sum() > 0:
-                cols.append("conversions")
             out = frame[cols].sort_values(rank_by_col, ascending=False).rename(columns={
                 "page_path": "Page", "sessions": "Sessions",
                 "engagement_rate": "Eng. Rate", "bounce_rate": "Bounce Rate",
                 "avg_engagement_s": "Avg Time", "new_user_rate": "New User Rate",
-                "conversions": "Conversions",
             }).copy()
             out["Eng. Rate"] = out["Eng. Rate"].map(_pct)
             out["Bounce Rate"] = out["Bounce Rate"].map(_pct)
@@ -595,12 +576,11 @@ def render():
 
             display_lp = lp[[
                 "landing_page", "page_category", "sessions", "new_users",
-                "engagement_rate", "avg_engagement_s", "conversions",
+                "engagement_rate", "avg_engagement_s",
             ]].rename(columns={
                 "landing_page": "Landing Page", "page_category": "Category",
                 "sessions": "Sessions", "new_users": "New Users",
                 "engagement_rate": "Eng. Rate", "avg_engagement_s": "Avg Time",
-                "conversions": "Conversions",
             }).copy()
             display_lp["Eng. Rate"] = display_lp["Eng. Rate"].map(_pct)
             display_lp["Avg Time"] = display_lp["Avg Time"].apply(_fmt_duration)

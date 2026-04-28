@@ -40,7 +40,7 @@ def _bucket(frame: pd.DataFrame, granularity: str) -> pd.DataFrame:
         frame["bucket_label"] = frame["bucket"].dt.strftime("%b %Y")
     else:  # Daily
         frame["bucket"] = frame["date"].dt.normalize()
-        frame["bucket_label"] = frame["bucket"].dt.strftime("%b %d")
+        frame["bucket_label"] = frame["bucket"].dt.strftime("%a %b %d")
     return frame
 
 
@@ -245,7 +245,7 @@ def render():
         x="bucket_label",
         y="impressions",
         title=f"{granularity} Impressions",
-        labels={"bucket_label": granularity.rstrip("ly") or "Date", "impressions": "Impressions"},
+        labels={"bucket_label": {"Daily": "Date", "Weekly": "Week", "Monthly": "Month"}.get(granularity, granularity), "impressions": "Impressions"},
     )
     fig_trend.update_xaxes(type="category")
     st.plotly_chart(fig_trend, width="stretch")
@@ -318,7 +318,7 @@ def render():
         color="page_category",
         barmode="group",
         title=f"Impressions by Page Category ({granularity})",
-        labels={"bucket_label": granularity.rstrip("ly") or "Date", "impressions": "Impressions"},
+        labels={"bucket_label": {"Daily": "Date", "Weekly": "Week", "Monthly": "Month"}.get(granularity, granularity), "impressions": "Impressions"},
     )
     fig_cat_trend.update_xaxes(type="category")
     st.plotly_chart(fig_cat_trend, width="stretch")

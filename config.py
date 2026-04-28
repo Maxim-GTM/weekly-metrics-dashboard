@@ -25,7 +25,19 @@ PAGE_CATEGORIES = {
     "/industry": "Industry Pages",
     "/pricing": "Pricing",
     "/features": "Features",
-    # Bifrost documentation (docs.bifrost.ai paths tracked under same GA4 property)
+    # Bifrost sub-sections (getmaxim.ai/bifrost/<segment>/...)
+    "/bifrost/provider-status": "Bifrost Provider Status",
+    "/bifrost/resources": "Bifrost Resources",
+    "/bifrost/model-library": "Bifrost Model Library",
+    "/bifrost/blog": "Bifrost Blog",
+    "/bifrost/industry-pages": "Bifrost Industry Pages",
+    "/bifrost/alternatives": "Bifrost Alternatives",
+    "/bifrost/partners-program": "Bifrost Partners Program",
+    "/bifrost/mcp-servers": "Bifrost Mcp Servers",
+    "/bifrost/oss-friends": "Bifrost Oss Friends",
+    "/bifrost/articles": "Bifrost Articles",
+    "/bifrost/built-with-bifrost": "Bifrost Built With Bifrost",
+    # Bifrost documentation (docs.getbifrost.ai paths tracked under same GA4 property)
     "/overview": "Bifrost Docs",
     "/quickstart": "Bifrost Docs",
     "/mcp": "Bifrost Docs",
@@ -36,7 +48,6 @@ PAGE_CATEGORIES = {
     "/architecture": "Bifrost Docs",
     "/plugins": "Bifrost Docs",
     "/models-catalog": "Bifrost Docs",
-    "/evals-handbook": "Bifrost Docs",
     "/contributing": "Bifrost Docs",
     "/benchmarking": "Bifrost Docs",
     "/migration-guides": "Bifrost Docs",
@@ -47,7 +58,6 @@ PAGE_CATEGORIES = {
 # Exact-match pages (checked before prefix matching).
 SPECIAL_PAGES = {
     "/": "Maxim Homepage",
-    "/enterprise": "Bifrost Enterprise",
     "/bifrost": "Bifrost",
     "/bifrost/enterprise": "Bifrost",
     "/bifrost/book-a-demo": "Bifrost",

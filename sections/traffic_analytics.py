@@ -42,7 +42,7 @@ def _bucket(frame: pd.DataFrame, granularity: str) -> pd.DataFrame:
         frame["bucket_label"] = frame["bucket"].dt.strftime("%b %Y")
     else:  # Daily
         frame["bucket"] = frame["date"].dt.normalize()
-        frame["bucket_label"] = frame["bucket"].dt.strftime("%b %d")
+        frame["bucket_label"] = frame["bucket"].dt.strftime("%a %b %d")
     return frame
 
 
@@ -342,10 +342,6 @@ def render():
         width="stretch",
     )
 
-    # --- Source trend over time ---
-    st.subheader("Sessions Over Time — Top Sources")
-    st.caption("Session volume for the top 8 sources plotted over time — shows which sources are trending up, down, or plateauing across the selected window.")
-
     granularity = st.radio(
         "Trend granularity",
         ["Daily", "Weekly", "Monthly"],
@@ -353,43 +349,6 @@ def render():
         key="ga4_granularity",
         help="Changes trend-chart x-axis only. Summary metrics and tables above are driven by the date range.",
     )
-
-    top_sources = source_latest.head(8)["session_source"].tolist()
-    trend_df = _bucket(df_src_display, granularity)
-    source_trend = (
-        trend_df[trend_df["session_source"].isin(top_sources)]
-        .groupby(["bucket", "bucket_label", "session_source"], observed=True)["sessions"]
-        .sum()
-        .reset_index()
-        .sort_values("bucket")
-    )
-    fig_source_trend = px.line(
-        source_trend,
-        x="bucket_label",
-        y="sessions",
-        color="session_source",
-        title=f"Top Sources Over Time ({granularity})",
-        markers=True,
-    )
-    fig_source_trend.update_xaxes(type="category")
-    st.plotly_chart(fig_source_trend, width="stretch")
-
-    totals = (
-        source_trend.groupby("session_source", observed=True)["sessions"]
-        .sum()
-        .reset_index()
-        .sort_values("sessions", ascending=False)
-    )
-    st.caption(f"Totals across {period_range_label}:")
-    st.dataframe(
-        totals.rename(columns={"session_source": "Source", "sessions": "Sessions"}),
-        hide_index=True,
-        width="stretch",
-    )
-
-    src_trend_summary = source_trend.groupby("session_source", observed=True)["sessions"].agg(["first", "last"]).reset_index()
-    src_trend_text = "\n".join(f"  {r['session_source']}: {int(r['first']):,} → {int(r['last']):,}" for _, r in src_trend_summary.iterrows())
-    render_chart_insight("source_trend", src_trend_text, "What's driving changes in traffic sources?")
 
     # --- Page category breakdown (latest period with change) ---
     # Entry Sessions  = sessions that started on a category page (ga4_landing_pages).
@@ -438,21 +397,6 @@ def render():
             .rename(columns={"sessions": "total_prev"})
         ) if not cat_prev_raw.empty else None
 
-        # Compute Other = ga4_traffic total − named category sum
-        traffic_total = int(df_src_latest["sessions"].sum()) if df_src is not None else 0
-        named_total = int(total_latest["total_sessions"].sum())
-        other_total = max(0, traffic_total - named_total)
-        other_row = pd.DataFrame([{"page_category": "Other", "total_sessions": other_total}])
-        total_latest = pd.concat([total_latest, other_row], ignore_index=True)
-
-        if total_prev is not None:
-            traffic_total_prev = int(_slice(df_src, prev_start, prev_end)["sessions"].sum()) if df_src is not None else 0
-            named_total_prev = int(total_prev["total_prev"].sum())
-            other_prev = max(0, traffic_total_prev - named_total_prev)
-            total_prev = pd.concat([
-                total_prev,
-                pd.DataFrame([{"page_category": "Other", "total_prev": other_prev}])
-            ], ignore_index=True)
     else:
         total_latest = None
         total_prev = None
@@ -575,18 +519,20 @@ def render():
     fig_drill.update_layout(showlegend=False)
     st.plotly_chart(fig_drill, width="stretch")
 
-    # "Other" breakdown table
-    if "Other" in drill_df["page_category"].astype(str).values:
-        other_df = (
-            drill_source_df[drill_source_df["page_category"].astype(str) == "Other"]
+    # Per-category landing page breakdowns for Bifrost Docs and Other
+    for cat_label in ("Bifrost Docs", "Other"):
+        if cat_label not in drill_df["page_category"].astype(str).values:
+            continue
+        cat_df = (
+            drill_source_df[drill_source_df["page_category"].astype(str) == cat_label]
             .groupby(lp_col)["sessions"]
             .sum()
             .reset_index()
             .sort_values("sessions", ascending=False)
         )
-        with st.expander(f"'Other' breakdown ({other_df['sessions'].sum():,} sessions)", expanded=True):
+        with st.expander(f"'{cat_label}' breakdown ({cat_df['sessions'].sum():,} sessions)", expanded=True):
             st.dataframe(
-                other_df.rename(columns={lp_col: "Landing Page", "sessions": "Sessions"}),
+                cat_df.rename(columns={lp_col: "Landing Page", "sessions": "Sessions"}),
                 hide_index=True,
                 width="stretch",
             )
