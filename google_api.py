@@ -37,11 +37,62 @@ CATEGORY_FILTERS: dict[str, list[tuple[str, str, str]]] = {
     "Model Library":      [("pagePath", "BEGINS_WITH", "/model-library")],
     "Bifrost Docs":       [("hostName", "EXACT",       "docs.getbifrost.ai")],
     "Maxim Homepage":     [("pagePath", "EXACT",       "/")],
-    "Bifrost Enterprise": [("pagePath", "EXACT",       "/enterprise")],
     "Bifrost":            [("pagePath", "EXACT",       "/bifrost"),
                            ("pagePath", "EXACT",       "/bifrost/enterprise"),
                            ("pagePath", "EXACT",       "/bifrost/book-a-demo")],
 }
+
+
+def _bifrost_category_filters() -> dict[str, list[tuple[str, str, str]]]:
+    """Build CATEGORY_FILTERS entries for /bifrost/* sub-pages.
+
+    Primary source: PAGE_CATEGORIES in config.py — explicit, visible, version-controlled.
+    Supplement: DB discovery for segments that have appeared in GA4 data but aren't
+    in config yet, so new Bifrost sections are picked up automatically on the next fetch.
+    """
+    from config import PAGE_CATEGORIES
+
+    result: dict[str, list[tuple[str, str, str]]] = {}
+
+    # Collect /bifrost/<segment> values already covered (from static CATEGORY_FILTERS)
+    covered_segments: set[str] = set()
+    for conds in CATEGORY_FILTERS.values():
+        for _, _, v in conds:
+            if v.startswith("/bifrost/"):
+                parts = v.split("/")
+                if len(parts) > 2:
+                    covered_segments.add(parts[2])
+
+    # Step 1: generate from PAGE_CATEGORIES — explicit source of truth
+    for prefix, cat_name in PAGE_CATEGORIES.items():
+        if not prefix.startswith("/bifrost/"):
+            continue
+        seg = prefix.split("/")[2] if len(prefix.split("/")) > 2 else ""
+        covered_segments.add(seg)
+        if cat_name not in CATEGORY_FILTERS and cat_name not in result:
+            result[cat_name] = [("pagePath", "BEGINS_WITH", prefix)]
+
+    # Step 2: DB discovery for segments not yet in config (data-driven supplement)
+    from db import query_df
+    try:
+        df = query_df(
+            "SELECT DISTINCT segment FROM ("
+            "  SELECT split_part(landing_page, '/', 3) AS segment"
+            "    FROM ga4_landing_pages WHERE landing_page LIKE '/bifrost/%'"
+            "  UNION"
+            "  SELECT split_part(page_path, '/', 3) AS segment"
+            "    FROM ga4 WHERE page_path LIKE '/bifrost/%'"
+            ") sub WHERE segment != ''"
+        )
+        for segment in df["segment"].dropna().tolist():
+            if segment and segment not in covered_segments:
+                cat_name = f"Bifrost {segment.replace('-', ' ').title()}"
+                if cat_name not in CATEGORY_FILTERS and cat_name not in result:
+                    result[cat_name] = [("pagePath", "BEGINS_WITH", f"/bifrost/{segment}")]
+    except Exception:
+        pass
+
+    return result
 
 
 def _build_category_filter(conditions: list[tuple[str, str, str]]) -> FilterExpression:
@@ -359,7 +410,6 @@ def fetch_ga4_data(start_date: str, end_date: str) -> int:
         dimensions=["date", "sessionSource", "sessionMedium"],
         metrics=["sessions", "totalUsers", "activeUsers",
                  "engagedSessions", "newUsers", "userEngagementDuration"],
-        dimension_filter=_not_jobs_filter("pagePath"),
         mapper=lambda dims, metrics: {
             "date": _ga4_date(dims[0]),
             "session_source": dims[1],
@@ -554,9 +604,11 @@ def fetch_ga4_category_sessions(
         weeks.append((wk, min(wk + timedelta(days=6), end)))
         wk += timedelta(days=7)
 
+    filters = {**CATEGORY_FILTERS, **_bifrost_category_filters()}
+
     all_rows = []
     for week_start, week_end in weeks:
-        for category, conditions in CATEGORY_FILTERS.items():
+        for category, conditions in filters.items():
             dim_filter = _build_category_filter(conditions)
             rows = _fetch_ga4_report(
                 client, property_id,
