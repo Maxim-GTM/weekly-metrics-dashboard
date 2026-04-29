@@ -39,9 +39,9 @@ def _parse_coverage_zip(zip_bytes: bytes) -> tuple[list[dict], list[dict], str |
     daily_rows = [
         {
             "date": str(row["Date"]),
-            "indexed": int(row["Indexed"]),
-            "not_indexed": int(row["Not indexed"]),
-            "impressions": int(row["Impressions"]),
+            "indexed": int(row["Indexed"]) if pd.notna(row["Indexed"]) else 0,
+            "not_indexed": int(row["Not indexed"]) if pd.notna(row["Not indexed"]) else 0,
+            "impressions": int(row["Impressions"]) if pd.notna(row["Impressions"]) else 0,
         }
         for _, row in chart.iterrows()
     ]
