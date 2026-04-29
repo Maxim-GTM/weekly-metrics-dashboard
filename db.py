@@ -420,15 +420,16 @@ def upsert_profound(rows: list[dict]):
 
 def replace_keyword_tiers(rows: list[dict]):
     """Truncate keyword_tiers and insert fresh rows. rows: [{keyword, tier}]."""
+    deduped = list({r["keyword"]: r for r in rows}.values())
     pool = get_pool()
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute("TRUNCATE keyword_tiers")
-            if rows:
+            if deduped:
                 cur.executemany(
                     "INSERT INTO keyword_tiers (keyword, tier) "
                     "VALUES (%(keyword)s, %(tier)s)",
-                    rows,
+                    deduped,
                 )
         conn.commit()
 
